@@ -66,6 +66,40 @@ CREATE TABLE IF NOT EXISTS aqi (
     PRIMARY KEY (source, location, observed_at)
 );
 
+CREATE TABLE IF NOT EXISTS daily_summary (
+    source             TEXT NOT NULL,
+    location           TEXT NOT NULL,
+    date               TEXT NOT NULL,   -- India calendar date, YYYY-MM-DD
+    state              TEXT,
+    lat                REAL,
+    lon                REAL,
+    aqi_mean           REAL,
+    aqi_min            INTEGER,
+    aqi_max            INTEGER,
+    aqi_hours          INTEGER,         -- how many AQI values the day has (coverage)
+    dominant_pollutant TEXT,
+    worst_category     TEXT,
+    readings_total     INTEGER,
+    readings_ok        INTEGER,
+    pct_ok             REAL,
+    fetched_at         TEXT NOT NULL,
+    PRIMARY KEY (source, location, date)
+);
+
+CREATE TABLE IF NOT EXISTS daily_pollutants (
+    source      TEXT NOT NULL,
+    location    TEXT NOT NULL,
+    date        TEXT NOT NULL,
+    pollutant   TEXT NOT NULL,
+    unit        TEXT,
+    value_min   REAL,
+    value_mean  REAL,
+    value_max   REAL,
+    n_readings  INTEGER,
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (source, location, date, pollutant)
+);
+
 CREATE INDEX IF NOT EXISTS idx_aq_time  ON air_quality (observed_at);
 CREATE INDEX IF NOT EXISTS idx_aqi_time ON aqi (observed_at);
 """
@@ -74,6 +108,8 @@ PRIMARY_KEYS = {
     "air_quality": ["source", "location", "observed_at", "pollutant"],
     "weather": ["source", "location", "observed_at"],
     "aqi": ["source", "location", "observed_at"],
+    "daily_summary": ["source", "location", "date"],
+    "daily_pollutants": ["source", "location", "date", "pollutant"],
 }
 
 
@@ -107,8 +143,12 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
 def _to_sql_values(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in df.columns:
-        if isinstance(df[col].dtype, pd.DatetimeTZDtype):
-            df[col] = df[col].map(lambda t: t.isoformat())
+        # Timestamps can hide in an `object` column too (e.g. after concatenating an
+        # empty frame), so check the values, not only the dtype.
+        if isinstance(df[col].dtype, pd.DatetimeTZDtype) or (
+            df[col].dtype == object and df[col].map(lambda v: isinstance(v, pd.Timestamp)).any()
+        ):
+            df[col] = df[col].map(lambda t: t.isoformat() if isinstance(t, pd.Timestamp) else t)
     # object dtype turns numpy ints/floats into plain Python values; NaN -> None (SQL NULL)
     return df.astype(object).where(df.notna(), None)
 
@@ -137,15 +177,18 @@ def read_sql(conn: sqlite3.Connection, query: str, params: tuple = ()) -> pd.Dat
     return pd.read_sql_query(query, conn, params=params)
 
 
-def read_air_quality_since(conn: sqlite3.Connection, since: pd.Timestamp) -> pd.DataFrame:
-    """All air-quality readings observed at or after `since`, with tz-aware timestamps.
+def read_since(conn: sqlite3.Connection, table: str, since: pd.Timestamp) -> pd.DataFrame:
+    """Rows of an observed_at-keyed table (air_quality, aqi) at or after `since`,
+    with tz-aware timestamps.
 
     Comparing ISO strings works because every stored timestamp has the same
     format and +05:30 offset (see design-qa.md, Q8 gotcha); `since` is converted
     to that same form first.
     """
+    if table not in ("air_quality", "aqi", "weather"):
+        raise ValueError(f"read_since doesn't support table {table!r}")  # never interpolate untrusted names into SQL
     since_str = since.tz_convert("Asia/Kolkata").isoformat()
-    df = read_sql(conn, "SELECT * FROM air_quality WHERE observed_at >= ?", (since_str,))
+    df = read_sql(conn, f"SELECT * FROM {table} WHERE observed_at >= ?", (since_str,))
     df["observed_at"] = pd.to_datetime(df["observed_at"], format="ISO8601").dt.tz_convert("Asia/Kolkata")
     return df
 

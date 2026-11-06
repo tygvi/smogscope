@@ -112,28 +112,32 @@ def compute_aqi(concentrations: dict[str, float]) -> AQIResult | None:
     )
 
 
-def concentrations_from_hourly(hourly: pd.DataFrame) -> dict[str, float]:
-    """Turn hourly readings into the averaged concentrations the AQI formula needs.
+def rolling_concentrations(hourly: pd.DataFrame) -> pd.DataFrame:
+    """For EVERY hour, the averaged concentrations the AQI formula needs at that hour.
 
-    `hourly`: DatetimeIndex (sorted), one column per pollutant, values in the units above.
-    Uses the 24 hours ending at the latest timestamp.
+    `hourly`: DatetimeIndex, one column per pollutant, values in the units above.
+    Returns a frame with the same index and columns; NaN where there isn't enough data.
+
+    - 24 h pollutants: mean of the 24 h window ending at that hour (>= 16 valid hours)
+    - 8 h pollutants:  max, over the 24 h window ending at that hour, of the
+                       8 h rolling means (each needing >= 6 valid hours)
+
+    Time-based windows ("24h", "8h") handle missing hours correctly (Q2).
     """
+    hourly = hourly.sort_index()
+    out = {}
+    for pollutant in hourly.columns:
+        series = hourly[pollutant]
+        if pollutant in EIGHT_HOUR_POLLUTANTS:
+            out[pollutant] = series.rolling("8h", min_periods=6).mean().rolling("24h").max()
+        else:
+            out[pollutant] = series.rolling("24h", min_periods=MIN_HOURS_FOR_24H_AVG).mean()
+    return pd.DataFrame(out, index=hourly.index)
+
+
+def concentrations_from_hourly(hourly: pd.DataFrame) -> dict[str, float]:
+    """Averaged concentrations as of the LATEST hour (the last row of rolling_concentrations)."""
     if hourly.empty:
         return {}
-    hourly = hourly.sort_index()
-    end = hourly.index.max()
-    window = hourly[hourly.index > end - pd.Timedelta(hours=24)]
-
-    out: dict[str, float] = {}
-    for pollutant in window.columns:
-        series = window[pollutant]
-        if pollutant in EIGHT_HOUR_POLLUTANTS:
-            # Time-based rolling window handles missing hours correctly.
-            value = series.rolling("8h", min_periods=6).mean().max()
-        else:
-            if series.count() < MIN_HOURS_FOR_24H_AVG:
-                continue
-            value = series.mean()
-        if pd.notna(value):
-            out[pollutant] = float(value)
-    return out
+    latest = rolling_concentrations(hourly).iloc[-1]
+    return {p: float(v) for p, v in latest.items() if pd.notna(v)}

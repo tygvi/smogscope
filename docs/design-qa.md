@@ -438,6 +438,108 @@ Its ozone values come rounded to whole numbers and can flatten out on a calm nig
 Arguments for: the check exists to catch sensor faults. Arguments against: a flat model output can also signal
 a broken model feed. For now the rule is unchanged and the case is recorded here, instead of being quietly special-cased.
 
+# Phase 2: Aggregates
+
+**The problem.** After the quality step, each run stored only *one* AQI per city: the latest. A dashboard chart
+("Delhi, last 48 hours") and the Phase 5 forecasting models both need a **complete hourly history**, and many
+questions are really about **days** ("how many Very Poor days did Lucknow have this month?").
+
+## Q19. Why compute an AQI for every hour, and why one shared averaging function?
+
+**Hourly history.** The `aqi` table is keyed by `(source, location, observed_at)`. Computing the AQI for **every hour**
+in the processed window, instead of only the last, fills that history immediately: the first run produced
+**720 rows** (15 cities × 48 hours) where before there were 15. Because writes are upserts (Q5), re-computing an
+hour that already exists just updates it.
+
+**One implementation, two uses.** The new `rolling_concentrations(hourly)` computes the averaged concentrations
+*for every hour at once* with pandas rolling windows. `concentrations_from_hourly` (the latest hour only) is now
+simply **its last row**. If two functions computed "the 24-hour average" separately, they would eventually drift
+apart, and the dashboard's "current AQI" would disagree with the last point on its own chart. This is the
+**DRY principle** (*don't repeat yourself*): one fact, one place.
+
+**A subtle definition change, made on purpose.** For CO and O₃, the old code computed 8-hour means using only data *inside*
+the 24-hour window, so the first few 8-hour means were based on partial windows. The new code computes every 8-hour mean from
+all available data, then takes the max over the 24-hour window. The results are the same except near the window's
+start, and the new version is closer to what an "8-hour average" means. All the original tests still pass.
+
+**Why vectorized:** `rolling("24h").mean()` processes the whole series in compiled code. Looping over 720 hours
+and slicing a 24-hour window for each one would do the same work hundreds of times over.
+
+## Q20. Why only emit hours that have a *full* 24 hours of history inside the window?
+
+Each run re-reads the last **72 hours**. Consider an hour near the start of that window, for example 60 hours ago:
+
+- Its 24-hour average needs the readings from 60 to 84 hours ago, but the window only goes back 72 hours.
+- With at least 16 valid hours (from 60 to 72 hours ago), the function *would* return a value, computed from only half a day.
+- That partial value would then **overwrite** the correct value stored by an earlier run that had the full 24 hours.
+
+So the pipeline asks only for hours **at or after `window start + 24 h`**. Every AQI it writes is then based on a full
+24-hour window. Older hours keep the values computed when their data was complete.
+
+**General lesson:** when a job recomputes a sliding window and upserts the results, check the **edges** of the window.
+Values near the edge are computed from less data, and upserts let them silently replace better values.
+
+## Q21. What goes into the daily summary, and what are its limits?
+
+`daily_summary`, one row per `(source, location, date)`:
+
+| Column | Meaning | Why |
+|---|---|---|
+| `aqi_mean`, `aqi_min`, `aqi_max` | Statistics of the day's hourly AQI | Typical vs. worst air |
+| `worst_category` | Category of `aqi_max` | "Was it ever Very Poor today?" |
+| `dominant_pollutant` | **Most frequent** dominant pollutant of the day | More representative than the dominant pollutant of the single worst hour |
+| `aqi_hours` | How many hourly AQI values the day has | **Coverage**: a day with 2 hours of data shouldn't be trusted like one with 24 |
+| `readings_total`, `readings_ok`, `pct_ok` | Data-quality statistics | Station reliability (the "lots of bad data" instinct from Q9) |
+
+`daily_pollutants` stores min, mean and max of each pollutant per day, from **clean** readings only.
+
+**Decisions in it:**
+
+- **Dates are India calendar dates.** A reading at 20:00 UTC on Nov 1 is 01:30 IST on Nov 2, so it belongs to **Nov 2**.
+  Grouping by UTC date would split every Indian day at 05:30 in the morning.
+- **Recomputed for today and the previous 2 days** on every run. Today is still filling up, and flags or late data
+  can change recent days. Older days are final.
+- **The coverage column is mandatory, not optional.** In the first run, Nov 4 had only 2 hours of data. Without
+  `aqi_hours`, it would look like a full day.
+
+**Known limit:** our daily `aqi_mean` is the **mean of hourly rolling AQIs**. CPCB's official daily bulletin is a
+*single* AQI computed at 4 pm from the preceding 24 hours. Both are legitimate metrics, but they aren't the same number, so
+the dashboard must label which one it shows.
+
+## Q22. Why store aggregates as tables instead of computing them when needed?
+
+**Stored (what we do), also called materialized:**
+
+- Reads are instant: the dashboard asks for "Delhi, last 30 days" and gets 30 pre-computed rows.
+- The cost is **staleness and duplication**. Summaries must be kept in sync with the raw data, which is why recent days are rebuilt every run.
+
+**Computed on demand** (a SQL view or Python on every request):
+
+- Always up to date, with no extra storage.
+- Every dashboard load would re-aggregate thousands of raw rows, which gets slow as history grows.
+
+Because raw data is never modified (Q9), the stored aggregates are **disposable**: delete the tables and they can be rebuilt.
+That makes storing them low-risk. In Phase 7, TimescaleDB's *continuous aggregates* do this refresh automatically.
+
+## Q23. A bug found by running the real pipeline: Timestamps in an `object` column
+
+**Symptom:** `sqlite3.ProgrammingError: Error binding parameter 6: type 'Timestamp' is not supported`.
+
+**Cause:** with CPCB skipped, `aqi_from_station_averages` returned an **empty** DataFrame. When pandas concatenated
+it with the Open-Meteo results, the `observed_at` column lost its datetime type and became a generic `object` column
+holding `Timestamp` values. `_to_sql_values` converted timestamps to text only for datetime columns, so
+SQLite received raw `Timestamp` objects.
+
+**Fix:** `_to_sql_values` now checks the **values** of object columns too. A regression test (`tests/test_db.py`)
+reproduces the exact situation so the bug can't return unnoticed.
+
+**Lessons:**
+
+- **Test the empty case.** "A source returns nothing" is a normal day for this project, given the CPCB outage.
+- **Defend at the boundary.** The database layer is where Python values become SQL values, so it should handle every
+  shape of input it can receive, instead of every caller being careful.
+- Unit tests passed and the real run still failed. Running the actual pipeline end to end is a necessary check.
+
 # Code reference: every function
 
 ## `aqi_india/config.py`
@@ -452,7 +554,9 @@ a broken model feed. For now the rule is unchanged and the case is recorded here
 - **`category(aqi)`**: maps a number to Good, Satisfactory, Moderate, Poor, Very Poor or Severe.
 - **`compute_aqi(concentrations)`**: sub-index for each pollutant, the max is the AQI, and that pollutant is dominant. Returns `None` unless
   at least 3 pollutants including PM2.5 or PM10 are available (Q1).
-- **`concentrations_from_hourly(hourly)`**: 24-hour means (requiring 16 valid hours) and the max 8-hour rolling mean for CO and O₃ (Q2).
+- **`rolling_concentrations(hourly)`**: for *every* hour, the 24-hour mean (requiring 16 valid hours), or for CO and O₃ the max
+  over 24 hours of the 8-hour rolling means (requiring 6 valid hours) (Q2, Q19).
+- **`concentrations_from_hourly(hourly)`**: the latest hour only, the last row of `rolling_concentrations` (Q19).
 - **`_round_half_up(x)`**: rounding that sends .5 upward, unlike Python's `round()` (Q3).
 - **`AQIResult`**: the result: aqi, category, dominant pollutant, all sub-indices.
 
@@ -476,9 +580,12 @@ a broken model feed. For now the rule is unchanged and the case is recorded here
 - **`connect(path)`**: opens SQLite, creates tables, runs migrations.
 - **`_migrate(conn)`**: adds columns that are missing from older databases (Q16).
 - **`upsert(conn, table, df)`**: idempotent insert-or-update keyed on each table's primary key (Q5).
-- **`_to_sql_values(df)`**: timestamps to ISO strings, numpy values to Python values, NaN to NULL.
+- **`_to_sql_values(df)`**: timestamps to ISO strings (including timestamps hidden in `object` columns, Q23),
+  numpy values to Python values, NaN to NULL.
 - **`read_sql(conn, query, params)`**: a query returned as a DataFrame.
-- **`read_air_quality_since(conn, since)`**: readings in a time window, with timestamps parsed back to tz-aware values.
+- **`read_since(conn, table, since)`**: rows of `air_quality`, `aqi` or `weather` at or after a time, with timestamps parsed
+  back to tz-aware values. Table names are checked against an allow-list, because they can't be passed as SQL
+  parameters and must never be built from untrusted input.
 - **`update_flags(conn, df)`**: writes `flag` and `flag_reason` back onto existing rows.
 
 ## `aqi_india/quality.py`
@@ -491,12 +598,21 @@ a broken model feed. For now the rule is unchanged and the case is recorded here
 
 ## `aqi_india/pipeline.py`
 
-- **`run_once()`**: ingest, assess, write flags, AQI from clean data, store (Q16).
+- **`run_once()`**: ingest, assess and write flags, hourly AQI from clean data, daily summaries (Q16, Q19–Q21).
 - **`_ingest(conn)`**: fetches and stores every source; skips CPCB on expected failures only (Q17).
-- **`aqi_from_hourly(readings)`**: AQI per location from hourly data (Open-Meteo).
-- **`aqi_from_station_averages(readings)`**: AQI per CPCB station from the latest published values.
-- **`_aqi_row(...)`**: builds one row of the `aqi` table.
-- **`main()`**: command-line entry point; prints the summary table.
+- **`aqi_from_station_averages(readings)`**: AQI per CPCB station from the latest published value of each pollutant.
+- **`main()`**: command-line entry point; prints the latest AQI per city.
+- **`QUALITY_WINDOW`** (72 h) and **`DAILY_LOOKBACK_DAYS`** (2): how much history each run re-processes.
+
+## `aqi_india/aggregates.py`
+
+- **`hourly_aqi(readings, since)`**: an AQI row for every hour of every location; `since` drops hours without a
+  full 24 hours of history in the window (Q19, Q20).
+- **`daily_summary(aqi, readings)`**: per location per India calendar day: AQI mean, min and max, worst category, most
+  frequent dominant pollutant, coverage, and data-quality share (Q21).
+- **`daily_pollutants(readings)`**: per location, day and pollutant: min, mean and max of clean readings.
+- **`_local_date(ts)`**: timestamp to India calendar date string.
+- **`LOCATION_COLS`**, **`AQI_COLS`**: the shared column lists for location data and `aqi` table rows.
 
 ## `aqi_india/scheduler.py`
 

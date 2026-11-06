@@ -12,3 +12,6 @@ data/*.db
 
 # Generated docs (rebuild with ./docs/build.sh)
 docs/build/
+
+# Runtime logs
+logs/
