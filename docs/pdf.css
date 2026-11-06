@@ -1,0 +1,18 @@
+@page { size: A4; margin: 18mm 16mm; }
+body {
+  font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+  font-size: 10.5pt; line-height: 1.5; color: #1f2328; max-width: none; margin: 0;
+}
+header#title-block-header { border-bottom: 2px solid #1f2328; margin-bottom: 1.2em; padding-bottom: .6em; }
+h1.title { font-size: 24pt; margin: 0; }
+p.subtitle { font-size: 12pt; color: #59636e; margin: .2em 0 0; }
+nav#TOC { font-size: 9.5pt; background: #f6f8fa; padding: .6em 1em; border-radius: 6px; }
+nav#TOC ul { padding-left: 1.2em; margin: .2em 0; }
+h1 { font-size: 17pt; border-bottom: 1px solid #d1d9e0; padding-bottom: .2em; margin-top: 1.6em; break-before: page; }
+h2 { font-size: 12.5pt; margin-top: 1.4em; color: #0b4a8b; break-after: avoid; }
+table { border-collapse: collapse; margin: .6em 0; font-size: 9.5pt; break-inside: avoid; }
+th, td { border: 1px solid #d1d9e0; padding: 4px 8px; text-align: left; }
+th { background: #f6f8fa; }
+code { font-family: Menlo, monospace; font-size: 9pt; background: #f6f8fa; padding: 1px 4px; border-radius: 4px; }
+pre { background: #f6f8fa; padding: .6em .8em; border-radius: 6px; break-inside: avoid; }
+pre code { padding: 0; }
