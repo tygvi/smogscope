@@ -36,7 +36,9 @@ def main() -> None:
         minutes=INTERVAL_MINUTES,
         next_run_time=datetime.now(),  # also run immediately on start
         max_instances=1,               # never overlap two runs
-        coalesce=True,                 # if runs were missed (laptop asleep), do just one
+        coalesce=True,                 # if runs were missed (laptop asleep), do just one...
+        misfire_grace_time=None,       # ...however late it is. The default (1 s) silently
+                                       # DROPS late runs, so after sleep nothing ran (Q38).
     )
     log.info("Scheduler started: every %d min. Ctrl+C to stop.", INTERVAL_MINUTES)
     try:

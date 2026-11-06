@@ -847,6 +847,29 @@ If anyone ever regenerates the file from a de facto–border dataset, these test
 **Also adjusted:** the initial map view moved slightly north and out (center 23.4°N, zoom 3.95) so the full official
 extent, from 6.7°N to 37.1°N, fits on a laptop screen.
 
+# Operations
+
+## Q38. Why did the scheduler stop collecting after the laptop slept?
+
+**Symptom:** at 23:17 the newest data was from 22:00. The scheduler process was alive, but the 22:33 and 23:03 runs
+never happened. The macOS power log showed the laptop **sleeping** in that window.
+
+**Cause:** APScheduler has a setting called `misfire_grace_time`: how late a run may start and still be executed. Its
+default is **1 second**. When the laptop woke, the missed runs were minutes late, so they were **silently dropped**, and the
+scheduler just waited for the next regular slot. `coalesce=True` (merge many missed runs into one) never got a chance,
+because a run that is too late is discarded before coalescing.
+
+**Fix:** `misfire_grace_time=None` (no limit) together with `coalesce=True`. However late it is, exactly **one** catch-up
+run happens after waking, followed by the normal 30-minute rhythm.
+
+**Lessons:**
+
+- **Read the defaults of anything that schedules work.** "Silently skip" is a dangerous default, and nothing was logged as an error.
+- **Monitor freshness, not just whether the process is running.** The process was healthy the whole time; only the *age
+  of the newest data* showed the problem. `/api/health` already reports `latest_aqi_at`, and Phase 7 should alert when it's older than about an hour.
+- A laptop is a poor server: sleep, lid closing and Wi-Fi changes all interrupt it. Deployment (Phase 7) moves the
+  scheduler to an always-on machine.
+
 # Code reference: every function
 
 ## `aqi_india/config.py`
@@ -926,7 +949,7 @@ extent, from 6.7°N to 37.1°N, fits on a laptop screen.
 ## `aqi_india/scheduler.py`
 
 - **`job()`**: one pipeline run, wrapped so a failure is logged and retried at the next interval instead of stopping the scheduler.
-- **`main()`**: APScheduler every 30 minutes, starting immediately, never overlapping runs, combining missed runs into one.
+- **`main()`**: APScheduler every 30 minutes, starting immediately, never overlapping runs; after sleep or downtime, exactly one catch-up run however late (`coalesce=True`, `misfire_grace_time=None`, Q38).
 
 ## `aqi_india/api.py`: the HTTP API
 
