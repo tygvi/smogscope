@@ -203,4 +203,99 @@ wrong answers. PostgreSQL's `timestamptz` type handles this correctly.
 
 # Phase 2: Processing and data quality
 
-*Added as Phase 2 decisions are made.*
+**The problem.** Phase 1 trusts every number it receives. Real sensor data, especially from CPCB, includes
+stuck sensors (the same value for hours), impossible values (negative, or far beyond any recorded level),
+physically impossible combinations (PM2.5 higher than PM10, even though PM10 *includes* PM2.5), and stale
+stations still showing as "live". Bad inputs lead to a wrong AQI, then a wrong dashboard, then a wrong ML model.
+
+Each decision below records **the initial proposal, the review, and the final decision**, because the
+reasoning matters more than the result.
+
+## Q9. When bad data is detected, delete it, fix it, or flag it?
+
+**Initial proposal:** if there is a lot of bad data, delete it; if there are only a few missing values, replace
+them with interpolated values.
+
+**What was right:** the *amount* of bad data matters, and that instinct is used in the final design.
+
+**Review: three problems.**
+
+1. **Missing and bad are different problems.** *Missing* data (gaps, NaN) is visibly absent. *Bad* data
+   (a stuck sensor, an impossible value) looks real. Interpolation can fill gaps; it can't repair a bad reading.
+2. **Deleting destroys evidence.** A station that is wrong 40% of the time is itself an important fact:
+   the dashboard should show "this station is unreliable." Once rows are deleted, you can't measure that,
+   audit it, or re-check old data with better thresholds later.
+3. **Interpolating at storage time fabricates data.** The filled values look like real measurements:
+   - CPCB's rule that a 24-hour average needs **16 real hours** is fooled, because interpolated hours count as valid.
+   - Phase 5 ML models would train on invented values and learn that pollution changes smoothly, which it doesn't.
+
+**Final decision: never modify raw data. Flag it.**
+
+- Every reading is stored as received, plus a quality flag: `ok`, `suspect` or `invalid`, and a `flag_reason`.
+- Code that *reads* the data decides what to exclude: the AQI uses only `ok`, and a "data quality" panel can show the rest.
+- Interpolation happens only at **read time**, only for **short gaps (2–3 hours)**, only where it's needed
+  (for example, smooth chart lines or ML features), and interpolated values are always marked as such.
+- The "lots of bad data" instinct becomes a **station-level reliability score**: the share of `ok` readings over the
+  last 7 days. A station below a threshold is marked unreliable as a whole.
+
+**Principle:** raw data is the source of truth, and everything else is a *view* of it. Views can be rebuilt; deleted
+raw data can't be recovered.
+
+## Q10. Where should quality checks run: ingestion, after storage, or at read time?
+
+**Initial proposal:** during ingestion, so bad data is caught as early as possible.
+
+**What was right:** catching problems early is a sound principle, and some checks *do* belong at ingestion.
+
+**Review:** the stuck-sensor rule (Q11) needs **6 hours of history**, but the CPCB API returns only **one
+value per station per fetch**. At ingestion time, the fetcher sees only a single number; the previous hours are
+already in the database. Any check that needs history can't run inside the fetcher.
+
+**Final decision: two separate layers.**
+
+| Layer | When | What it checks | What happens |
+|---|---|---|---|
+| **Validation** | At ingestion, in the fetchers | Can't be parsed, missing timestamp, NaN, unknown pollutant | Row **rejected** (it's broken, not suspicious) |
+| **Quality checks** | Separate step after storage (`quality.py`) | Range, stuck sensor, PM2.5 > PM10, staleness | Row **flagged** |
+
+**Benefits of the separation:**
+
+- Quality checks can use the database's full history.
+- They are **re-runnable**: improve a threshold, re-run over all past data, and every flag updates.
+  This works only because raw data was never deleted or changed (Q9).
+- Each layer is small and testable in isolation.
+
+**Rule of thumb:** *validate* structure at the boundary; *assess* quality where you have context.
+
+## Q11. When is a sensor "stuck"?
+
+**Initial proposal:** 6 hours of the same AQI value. Short plateaus (around 3 hours) can be real, but 6 hours is
+almost certainly a stuck sensor.
+
+**What was right:** 6 hours is a reasonable starting default, and leaving room for real plateaus is the right way to think about it.
+
+**Review: two refinements.**
+
+1. **Check raw concentrations, not the AQI.** The AQI is built from **24-hour averages**, so it barely changes from hour
+   to hour by design. A stuck-AQI rule would flag nearly every station. Stuck detection must run on the
+   **hourly raw values** of each pollutant.
+2. **Low values legitimately repeat.** CPCB reports rounded values. In a clean city, SO₂ can really read
+   `4, 4, 4, 4, 4, 4, 4`: the air is stable and the value rounds the same way. Repeating `118` for 6 hours is
+   suspicious; repeating `4` isn't. The rule needs a **minimum level** below which repeats are ignored.
+
+**Final decision:**
+
+- **Stuck** = at least `min_run = 6` *consecutive hourly* readings with the *identical* value, for the same
+  source, location and pollutant, **and** the value is above a per-pollutant minimum level.
+- Flag: `suspect` (not `invalid`, because a plateau is unlikely but not impossible).
+- Both numbers are **configurable parameters**, not hard-coded.
+- **Revisit with data:** once there is about a week of CPCB history, plot the distribution of run lengths of
+  repeated values per pollutant and set the thresholds from it. Thresholds should come from data, not guesses.
+
+## Phase 2 decisions at a glance
+
+| | Decision |
+|---|---|
+| **A: Handling** | Keep all raw data; add `flag` + `flag_reason`; exclude or interpolate only at read time |
+| **B: Placement** | Validation at ingestion; quality checks as a separate, re-runnable step after storage |
+| **C: Stuck sensor** | 6 or more identical consecutive hourly values above a minimum level, both configurable, later tuned on real data |
