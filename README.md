@@ -17,6 +17,7 @@ through an API to an animated map dashboard.
 - **72-hour playback:** scrub or play through the last three days on the map
 - **City panel:** animated AQI, health advice, pollutant sub-indices, weather, a 72-hour chart colored by category, and daily summaries
 - **Data quality:** flags impossible values, stuck sensors, and PM2.5 > PM10. Flagged data is kept but never used for the AQI.
+- **India's official boundary** (Survey of India), including all of Jammu & Kashmir and Ladakh, drawn over the basemap and tested
 - Works on phones; respects *reduced motion* settings
 
 <p>
@@ -49,7 +50,7 @@ CPCB ───────┴──▶ │       → daily summaries            
 | Storage | SQLite (WAL mode); moving to PostgreSQL + TimescaleDB later |
 | API | FastAPI, Pydantic, uvicorn |
 | Frontend | React 19, TypeScript, Vite, MapLibre GL, Canvas 2D, Framer Motion, Recharts |
-| Tests | pytest (75), Vitest (3) |
+| Tests | pytest (90), Vitest (3) |
 
 ## Quick start
 
@@ -106,4 +107,4 @@ Interactive documentation: `http://localhost:8000/docs`.
 - [ ] Phase 6: satellite data: fire hotspots, smoke segmentation, PM2.5 where there are no stations
 - [ ] Phase 7: PostgreSQL + TimescaleDB, Docker, deployment, alerts
 
-Map data © OpenStreetMap contributors, basemap © CARTO. Air quality and weather © Open-Meteo (CAMS / national weather services).
+Map data © OpenStreetMap contributors, basemap © CARTO. India boundary: Survey of India via [DataMeet](https://github.com/datameet/maps) (CC-BY-SA 2.5 / ODbL; the simplified file in `web/public/` carries the same license). Air quality and weather © Open-Meteo (CAMS / national weather services).

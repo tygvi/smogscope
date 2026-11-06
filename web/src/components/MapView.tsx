@@ -6,9 +6,45 @@ import { CATEGORIES, categoryInfo, colorOf } from '../aqi'
 import WindLayer from './WindLayer'
 
 // Free vector basemap (CARTO Dark Matter, OpenStreetMap data), no API key needed.
-// Note: OSM-based tiles draw international boundaries per OSM conventions, which
-// differ from India's official map in disputed areas (see design-qa.md, Q30).
 const STYLE_URL = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'
+
+// The basemap draws borders the OSM way (de facto lines in Jammu & Kashmir and
+// Ladakh). These layers are hidden and India's OFFICIAL boundary (Survey of India)
+// is drawn instead, from web/public/india-boundary.geojson (design-qa.md, Q37).
+const BASEMAP_BORDER_LAYERS = ['boundary_country_outline', 'boundary_country_inner', 'boundary_state', 'boundary_county']
+const BOUNDARY_URL = '/india-boundary.geojson'
+
+type IndiaBoundary = GeoJSON.FeatureCollection<GeoJSON.MultiPolygon>
+
+/** A world-sized polygon with India cut out as holes: used to dim everything outside India. */
+function outsideMask(india: IndiaBoundary): GeoJSON.Feature<GeoJSON.Polygon> {
+  const world = [[-180, -85], [180, -85], [180, 85], [-180, 85], [-180, -85]]
+  const holes = india.features.flatMap((f) => f.geometry.coordinates.map((polygon) => polygon[0]))
+  return { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [world, ...holes] } }
+}
+
+async function addOfficialBoundary(m: MlMap) {
+  for (const id of BASEMAP_BORDER_LAYERS) {
+    if (m.getLayer(id)) m.setLayoutProperty(id, 'visibility', 'none')
+  }
+  const india = (await (await fetch(BOUNDARY_URL)).json()) as IndiaBoundary
+  // Insert below the basemap's labels, so place names stay crisp on top.
+  const firstLabel = m.getStyle().layers.find((l) => l.type === 'symbol')?.id
+  m.addSource('india', { type: 'geojson', data: india })
+  m.addSource('outside-india', { type: 'geojson', data: outsideMask(india) })
+  m.addLayer({
+    id: 'outside-india', type: 'fill', source: 'outside-india',
+    paint: { 'fill-color': '#04060b', 'fill-opacity': 0.5 },
+  }, firstLabel)
+  m.addLayer({
+    id: 'india-border', type: 'line', source: 'india',
+    paint: {
+      'line-color': '#9fb3d1',
+      'line-opacity': 0.7,
+      'line-width': ['interpolate', ['linear'], ['zoom'], 3, 0.8, 6, 1.4, 9, 2.2],
+    },
+  }, firstLabel)
+}
 
 interface Props {
   cities: CityNow[]
@@ -45,18 +81,23 @@ export default function MapView(props: Props) {
     const m = new maplibregl.Map({
       container: containerRef.current!,
       style: STYLE_URL,
-      center: [80.5, 22.5],
-      zoom: window.innerWidth < 700 ? 3.3 : 4.1,
+      center: [80.5, 23.4],
+      zoom: window.innerWidth < 700 ? 3.25 : 3.95,  // fits India's full official extent, 6.7°N to 37.1°N
       minZoom: 3,
       maxZoom: 9,
       maxBounds: [[50, -5], [112, 42]],
-      attributionControl: { compact: true },
+      attributionControl: {
+        compact: true,
+        customAttribution: 'India boundary: Survey of India via DataMeet (CC-BY-SA)',
+      },
       dragRotate: false,
       pitchWithRotate: false,
     })
     m.touchZoomRotate.disableRotation()
     m.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-right')
     m.on('load', () => {
+      addOfficialBoundary(m).catch((e) => console.error('Could not load India boundary', e))
+
       // "Smog glow": a large, fully blurred circle per city, COLORED BY ITS AQI and
       // sized by it (worse air = bigger haze). Not a heatmap: a heatmap colors by
       // point DENSITY, so 15 isolated cities would all glow "low" (Q31).

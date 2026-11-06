@@ -680,8 +680,7 @@ initial download is ~360 KB gzipped, most of it MapLibre.
 
 **India's boundaries.** OpenStreetMap-based tiles draw international boundaries using OSM's conventions, which
 differ from India's official map in disputed regions. Indian law and policy expect maps published in India to show
-the official boundaries. For a personal portfolio project this is a known limitation. A public deployment in India
-should use a basemap that follows Survey of India boundaries, or draw boundaries from an official source.
+the official boundaries. This was first recorded here as a known limitation, and then **fixed** (Q37).
 
 ## Q31. Markers and smog glow, and the two bugs found by looking
 
@@ -792,6 +791,62 @@ than no test. Wait for conditions, not for fixed amounts of time.
 **Not automated yet:** visual appearance. The screenshots in `docs/images/` are the record. Automated visual-regression
 tests could come with the Phase 7 deployment work.
 
+# India's official boundary
+
+## Q37. How does the map show India's boundary according to Indian standards?
+
+**The problem.** The CARTO basemap is built from OpenStreetMap, which draws **de facto** lines in disputed areas:
+the Line of Control in Kashmir and the Line of Actual Control in Ladakh. India's official map (Survey of India) shows
+**all** of Jammu & Kashmir and Ladakh, including Pakistan-administered Kashmir (PoK), Gilgit-Baltistan and Aksai Chin,
+as part of India. Maps published in India are expected to follow the official depiction, so the basemap's border was wrong
+for an Indian dashboard.
+
+**The fix, in four parts:**
+
+1. **Hide the basemap's borders.** The style's `boundary_country_outline`, `boundary_country_inner`, `boundary_state` and
+   `boundary_county` layers are switched off when the map loads. (State lines in J&K and Ladakh also follow OSM's version.)
+2. **Draw the official outline ourselves** from `web/public/india-boundary.geojson`, as a line layer.
+3. **Dim everything outside India** with a "mask": a world-sized polygon with India cut out as holes, filled
+   at 50% opacity. India stands out, and neighboring countries' internal borders (which also disappeared in step 1) matter less.
+4. **Insert both layers below the basemap's labels**, so place names stay readable on top.
+
+**Choosing the data.** The DataMeet maps repository offers three versions of India's outline:
+
+| File | Built from | License | Chosen? |
+|---|---|---|---|
+| `india-soi.geojson` | **Survey of India / Census 2011** maps, dissolved | CC-BY-SA 2.5 / ODbL | **✓ closest to "Indian standards"** |
+| `india-composite.geojson` | US State Dept. LSIB + other public sources, assembled to match the official claim | CC-0 | Fallback |
+| `india-osm.geojson` | OSM boundaries plus claimed areas | ODbL | ✗ |
+
+The Survey of India–derived file was chosen because it comes from the official source. Its license requires **attribution**,
+which is shown in the map's credits ("India boundary: Survey of India via DataMeet (CC-BY-SA)"), and **share-alike**: our
+simplified file is a derived work, so it carries the same license.
+
+**Making it web-sized.** The original is 12 MB with 281,810 points, far too large for a browser.
+`scripts/simplify_boundary.py` reduces it to **4,884 points (78 KB, 25 KB compressed)**:
+
+- **Ramer–Douglas–Peucker simplification** with a 0.01° (~1 km) tolerance: keep a point only if removing it would move
+  the line by more than the tolerance. At national zoom levels, 1 km is far less than one pixel.
+- Coordinates rounded to 3 decimals (~100 m), and specks smaller than ~2 km × 2 km dropped (618 → 154 polygons; the
+  Andaman, Nicobar and Lakshadweep islands remain).
+
+**A bug in the simplifier, worth remembering:** the first run deleted *every* polygon. RDP measures each point's distance
+from the line between the **first and last** points, but in a closed ring those are the **same point**. The "line"
+has zero length, every distance comes out as 0, and the ring collapses. The fix is to split each ring at the point
+farthest from its start and simplify the two halves. **Lesson:** an algorithm written for open lines needs care on closed shapes.
+
+**Verified, not assumed.** `tests/test_boundary.py` runs a **point-in-polygon test** (ray casting: count how many edges a
+ray to the east crosses; odd means inside) on the committed file:
+
+- **Inside:** New Delhi, Srinagar, Leh, Muzaffarabad (PoK), Gilgit, Aksai Chin, Tawang, Port Blair
+- **Outside:** Lahore, Islamabad, Kathmandu, Dhaka, Colombo
+- The northernmost point is above 37°N in Gilgit-Baltistan, matching the official northern tip.
+
+If anyone ever regenerates the file from a de facto–border dataset, these tests fail.
+
+**Also adjusted:** the initial map view moved slightly north and out (center 23.4°N, zoom 3.95) so the full official
+extent, from 6.7°N to 37.1°N, fits on a laptop screen.
+
 # Code reference: every function
 
 ## `aqi_india/config.py`
@@ -900,7 +955,7 @@ tests could come with the Phase 7 deployment work.
 - **`aqi.ts`**: AQI categories with colors, pulse speeds and health advice; `categoryInfo(aqi)`, `colorOf(aqi)`, pollutant labels with subscripts.
 - **`hooks.ts`**: `usePolling(fetcher, interval)` fetches and refreshes, keeping the last good data and cancelling on unmount;
   `usePrefersReducedMotion()`; `formatTime(iso)` in India time.
-- **`components/MapView.tsx`**: creates the MapLibre map once; keeps one HTML marker per city in sync with live or playback AQI;
+- **`components/MapView.tsx`**: creates the MapLibre map once; hides the basemap's borders and draws India's official boundary with an outside-India mask (`addOfficialBoundary`, `outsideMask`, Q37); keeps one HTML marker per city in sync with live or playback AQI;
   manages the smog-glow layer; flies to the selected city (Q30, Q31).
 - **`components/WindLayer.tsx`**: the particle system (Q32). `sampleWind(grid, lon, lat)` does the bilinear interpolation, exported for tests.
 - **`components/CityPanel.tsx`**: the city detail panel: animated AQI, advice, sub-index bars, weather, a 72-hour chart
@@ -910,3 +965,10 @@ tests could come with the Phase 7 deployment work.
 - **`components/AnimatedNumber.tsx`**: a number that counts smoothly from its previous value to the new one.
 - **`styles.css`**: dark theme tokens, glass panels, marker pulse animation, the phone layout, reduced-motion rules.
 - **`components/WindLayer.test.ts`**: Vitest tests for `sampleWind`.
+
+## `scripts/` and boundary data
+
+- **`scripts/simplify_boundary.py`**: builds `web/public/india-boundary.geojson` from DataMeet's Survey of India outline:
+  closed-ring-safe RDP simplification, coordinate rounding, sliver removal, and point-in-polygon checks (Q37).
+- **`web/public/india-boundary.geojson`**: India's official boundary, simplified (CC-BY-SA 2.5 / ODbL, attribution in the map).
+- **`tests/test_boundary.py`**: guards the official depiction (13 locations, the northern tip, and file size).
