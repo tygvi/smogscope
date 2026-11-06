@@ -83,6 +83,50 @@ def fetch_air_quality(cities: list[City], past_days: int = 2) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=AQ_COLUMNS)
 
 
+def fetch_wind_grid(
+    lat_min: float = 6.0, lat_max: float = 36.0,
+    lon_min: float = 68.0, lon_max: float = 98.0,
+    step: float = 2.0,
+) -> dict:
+    """Current 10 m wind on a regular lat/lon grid covering India, as u/v components.
+
+    Returns a JSON-friendly dict:
+      lat0, lon0, dlat, dlon, nx (columns, west->east), ny (rows, south->north),
+      u, v: flat lists of length nx*ny in row-major order (index = row * nx + col), m/s,
+      observed_at: ISO time of the model step.
+
+    u = eastward component, v = northward component. Meteorological direction is
+    where the wind comes FROM, so a wind "from 0°" (north) blows south -> v < 0.
+
+    Open-Meteo counts every location toward its free daily limit, so the grid is
+    deliberately coarse (2° -> 16 x 16 = 256 points) and callers should cache it.
+    """
+    import math
+
+    lats = [lat_min + i * step for i in range(int(round((lat_max - lat_min) / step)) + 1)]
+    lons = [lon_min + j * step for j in range(int(round((lon_max - lon_min) / step)) + 1)]
+    points = [City("", "", lat, lon) for lat in lats for lon in lons]  # row-major, south->north
+
+    results = _get(WEATHER_URL, points, {
+        "current": "wind_speed_10m,wind_direction_10m",
+        "wind_speed_unit": "ms",
+    })
+
+    u, v = [], []
+    for result in results:
+        speed = result["current"]["wind_speed_10m"] or 0.0
+        direction = math.radians(result["current"]["wind_direction_10m"] or 0.0)
+        u.append(round(-speed * math.sin(direction), 2))
+        v.append(round(-speed * math.cos(direction), 2))
+
+    return {
+        "lat0": lats[0], "lon0": lons[0], "dlat": step, "dlon": step,
+        "nx": len(lons), "ny": len(lats), "u": u, "v": v, "unit": "m/s",
+        "observed_at": (pd.Timestamp(results[0]["current"]["time"]).tz_localize(TIMEZONE).isoformat()
+                        if results else None),
+    }
+
+
 def fetch_weather(cities: list[City]) -> pd.DataFrame:
     """Current weather conditions, one row per city."""
     results = _get(WEATHER_URL, cities, {"current": ",".join(WEATHER_VARIABLES)})

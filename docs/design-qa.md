@@ -160,11 +160,18 @@ This is a planned improvement for Phase 2.
 |---|---|---|
 | Network round trips | 1 | 15 (each with DNS, TLS and latency) |
 | Time | ~0.5 s | ~5–10 s if done one after another |
-| Requests per day (2 endpoints × 48 runs) | 96 | 1,440 |
+| HTTP requests per day (2 endpoints × 48 runs) | 96 | 1,440 |
 | Data consistency | All cities from the same model run | Cities could come from different updates |
 
-**Rate limits** are the main reason. Free APIs cap requests per day. Batching is the first
-optimization to reach for with any API that supports it.
+**Fewer round trips** are the main win: less latency, less connection overhead, and less chance of a
+partial failure halfway through. Batching is the first optimization to reach for with any API that supports it.
+
+**Correction (added in Phase 3):** this answer originally claimed batching also saves *rate-limit quota*.
+For Open-Meteo, that's wrong. Its free tier counts **every location** in a request as a separate
+call, so 15 cities cost 15 calls whether you send 1 request or 15. Our real usage is
+15 cities × 2 endpoints × 48 runs ≈ **1,440 calls per day** against a limit of roughly 10,000. That still fits, but the
+quota math only became visible when the wind grid (Q27) added hundreds of locations per request.
+**Lesson:** read an API's actual billing and quota rules; don't assume "one request = one unit".
 
 **Trade-offs of batching:**
 
@@ -540,6 +547,251 @@ reproduces the exact situation so the bug can't return unnoticed.
   shape of input it can receive, instead of every caller being careful.
 - Unit tests passed and the real run still failed. Running the actual pipeline end to end is a necessary check.
 
+# Phase 3: The API (FastAPI)
+
+**The problem.** A browser can't open a SQLite file. The frontend needs an **HTTP API**: URLs that return JSON.
+Phase 3 builds it, and Phase 4 (the frontend) was built at the same time against it.
+
+## Q24. Why FastAPI?
+
+| | FastAPI | Flask | Django |
+|---|---|---|---|
+| Input validation | Automatic, from type hints | Manual or via add-ons | Forms/serializers |
+| API documentation | Generated automatically (`/docs`) | Add-on | Add-on (DRF) |
+| Response contract | Pydantic models | Manual | Serializers |
+| Size | Small, API-focused | Small | Large: ORM, admin, templates |
+
+The deciding feature: **type hints do three jobs at once.** `hours: Annotated[int, Query(ge=1, le=720)]`
+
+1. **Validates:** `?hours=abc` or `?hours=0` is rejected with a **422** error before our code runs.
+2. **Documents:** the parameter, its type and its limits appear in the interactive docs at `/docs`.
+3. **Type-checks:** your editor knows `hours` is an `int`.
+
+Response models (`CityNow`, `Timeline`, …) are the **contract** with the frontend. FastAPI checks every response against them,
+so a renamed column fails loudly on the server instead of quietly showing `undefined` in the browser.
+`web/src/api.ts` mirrors these models in TypeScript.
+
+Django would bring an ORM, an admin site and templates, none of which we need. Flask would mean writing the validation and docs ourselves.
+
+## Q25. How were the endpoints designed?
+
+**Shaped around what the screens need, not around the tables.** The map needs *latest AQI per city plus weather*, which
+is a join of two tables and a "latest row per group" query. Exposing raw tables would push that logic into the browser.
+
+| Endpoint | Screen element |
+|---|---|
+| `/api/cities` | Markers, ranking list |
+| `/api/overview` | National average, category distribution bar |
+| `/api/timeline` | 72-hour map playback |
+| `/api/cities/{city}/history` | City panel: 72-hour chart |
+| `/api/cities/{city}/daily` | City panel: daily bars |
+| `/api/wind` | Wind particles |
+
+**Decisions in the details:**
+
+- **Read-only.** Only the scheduler writes. The API can't corrupt data, and the two can be scaled or restarted independently.
+- **Every route under `/api/`.** The same server also serves the frontend at `/` (Q28), and the prefix keeps them from colliding.
+- **404 for unknown cities**, with a message, instead of an empty list. "No such city" and "city with no data" are different situations.
+- **History returns only `flag = 'ok'` readings,** consistent with Q9: flagged data is stored but not shown as fact.
+- **The timeline uses parallel arrays.** `times[i]` goes with `aqi[i]` for every city. A list of
+  `{city, time, aqi}` objects would repeat every key about 1,000 times. The frontend just indexes by hour, which
+  is exactly what playback needs.
+- **`source` is a parameter** (default `open-meteo`), so CPCB station data can be added without new endpoints.
+
+## Q26. How do the API and the scheduler share one SQLite file safely?
+
+Two processes use the database at once: the scheduler **writes** every 30 minutes, and the API **reads** on every request.
+
+- **WAL mode** (`PRAGMA journal_mode=WAL`). In SQLite's default mode, a write locks out readers. In
+  *write-ahead logging* mode, readers keep reading the last committed data while a write is in progress, and a reader never
+  blocks the writer. It's a single setting stored in the database file.
+- **`timeout=10`:** if the database is briefly locked, wait up to 10 seconds instead of failing immediately.
+- **One connection per request**, provided by a FastAPI *dependency* (`get_conn`) that always closes it.
+  A single shared global connection would be used by many threads at once, which is unsafe.
+- **`check_same_thread=False`** for API connections. FastAPI may create the connection in one worker thread and
+  use it in another. SQLite's check exists to catch accidental sharing; here each connection still has exactly one user at a time.
+
+This works well for one machine and modest traffic. Many concurrent writers are a reason to move to PostgreSQL (Q8).
+
+## Q27. The wind grid: why fetched by the API with a 1-hour cache?
+
+**Grid size from quota math.** Open-Meteo counts each location as one call (see the Q7 correction):
+
+| Grid | Points | Refreshed every 30 min | Refreshed hourly |
+|---|---|---|---|
+| 1.5° | 441 | ~21,000/day ❌ | ~10,600/day ❌ |
+| **2°** | **256** | ~12,300/day ❌ | **~6,100/day ✓** |
+
+Together with the pipeline's ~1,440 calls per day, a **2° grid refreshed at most hourly** stays under the ~10,000 limit. The
+model's wind only changes hourly anyway, so refreshing more often would add nothing.
+
+**Why the API fetches it, not the scheduler:** the wind is *display data*. It isn't used in any calculation and
+doesn't need history (yet). Fetching **on demand** means no calls when nobody is looking.
+
+**The cache:**
+
+- **1-hour TTL**, kept in memory.
+- **A lock**, so when 50 visitors arrive at once after the cache expires, only **one** refresh runs. Without it, all 50 would
+  fetch at the same moment. This is the *thundering herd* problem.
+- **Serve stale data on error.** If a refresh fails, keep serving the last good grid. Slightly old wind is better than none.
+  **503** is returned only if there has never been a successful fetch.
+
+**u/v from speed and direction.** Weather data reports where the wind comes **from**. A "north wind" (0°) blows
+south. So `u = −speed·sin(θ)` (eastward) and `v = −speed·cos(θ)` (northward). Getting this sign wrong makes
+every particle fly backwards, which is a classic bug.
+
+## Q28. Why one server in production, and a proxy in development?
+
+**Production:** after `npm run build`, FastAPI serves the built frontend (`web/dist`) at `/` and the API at `/api/`.
+That's one process, one port, and **one origin**.
+
+**Development:** Vite's dev server (port 5173, instant reload) **proxies** `/api` to uvicorn (port 8000).
+
+**Why this matters:** browsers block a page from calling a *different origin* (scheme + host + port) unless the
+server allows it with **CORS** headers. With the same origin in both setups, there's no CORS configuration to get
+wrong, and the frontend uses the same relative URLs (`/api/cities`) everywhere.
+
+# Phase 4: The frontend
+
+## Q29. Which stack, and why?
+
+| Need | Choice | Rejected alternatives |
+|---|---|---|
+| UI framework | **React + TypeScript** | Svelte (smaller ecosystem for maps); plain JS (no type safety across the API contract) |
+| Build tool | **Vite** | Webpack (slower, more config) |
+| Map | **MapLibre GL** | Leaflet (no GPU rendering, so weak for animation); Mapbox GL (requires a token, paid beyond the free tier); Google Maps (key, billing, limited styling) |
+| Wind rendering | **Canvas 2D** (hand-written) | deck.gl or WebGL shaders (more powerful, much more complex). 3,000 particles fit easily in Canvas 2D. |
+| UI animation | **Framer Motion** | CSS-only (fine for simple loops, awkward for count-ups and enter/exit animations) |
+| Charts | **Recharts** | Chart.js (not React-based), D3 directly (too low-level for two charts) |
+
+**Exact versions** (`"react": "19.1.0"`, not `"^19"`). Everyone who installs gets the same code, and upgrades happen on purpose.
+Pinning only direct dependencies isn't enough, though (Q35).
+
+**Lazy loading:** the city panel and its charting library (~100 KB gzipped) load only when a city is first opened. The
+initial download is ~360 KB gzipped, most of it MapLibre.
+
+## Q30. The base map: MapLibre and CARTO tiles
+
+- **Vector tiles** (shapes, not images) render on the GPU, so zoom is smooth and the map can be styled dark.
+- **CARTO Dark Matter** is free for this use, needs no key, and suits glowing particles and markers.
+  Attribution (© OpenStreetMap, © CARTO) is shown as the license requires.
+- **Interaction limits:** rotation and tilt are disabled (a tilted India map doesn't help anyone), and
+  `maxBounds` keeps the view around South Asia.
+
+**India's boundaries.** OpenStreetMap-based tiles draw international boundaries using OSM's conventions, which
+differ from India's official map in disputed regions. Indian law and policy expect maps published in India to show
+the official boundaries. For a personal portfolio project this is a known limitation. A public deployment in India
+should use a basemap that follows Survey of India boundaries, or draw boundaries from an official source.
+
+## Q31. Markers and smog glow, and the two bugs found by looking
+
+**HTML markers** (DOM elements positioned by MapLibre) instead of map layers: with 15 cities, the DOM is cheap, and
+it brings CSS animation, real `<button>` elements (focusable, clickable, screen-reader labels) and easy text.
+With ~500 CPCB stations, they'd move to a GPU *circle layer* for performance.
+
+**Pulse speed encodes severity:** Good and Satisfactory don't pulse; Moderate pulses every 2.6 s and Severe every 0.8 s. Motion
+draws attention, so only the bad cities get it.
+
+**Bug 1: markers in the wrong countries.** Chennai appeared in Cambodia. The cause was the CSS rule
+`.marker { position: relative }`. MapLibre positions each marker with `position: absolute` plus a transform,
+and my rule overrode that, so the markers fell back into normal page flow and **each was pushed down by the ones
+before it**. The offsets added up. The fix: never override `position` on a MapLibre marker.
+**Lesson:** when you style elements that a library positions, find out which CSS properties it relies on.
+
+**Bug 2: the glow was green everywhere.** The first glow was a **heatmap layer**. A heatmap colors by **point
+density** (how many points are near each other), not by their values. With 15 isolated cities, density is low everywhere,
+so everything got the "low" color, even around Delhi. The fix: a large, fully blurred **circle per city, colored by
+its AQI**, with a radius that grows with AQI. **Lesson:** know what a visualization encodes before you use it. Heatmaps are for many points.
+
+## Q32. How does the wind animation work?
+
+Each frame (about 60 per second), for each of ~3,000 particles:
+
+1. **Sample the wind** at the particle's longitude and latitude using **bilinear interpolation**: a weighted average of the 4 surrounding
+   grid points, where closer points weigh more. This turns a coarse 16 × 16 grid into a smooth field.
+2. **Move it:** `position += velocity × step`. This is **Euler integration** of a vector field, the same idea as a
+   physics simulation. Two corrections:
+   - A degree of longitude is shorter away from the equator, so the longitude change is divided by `cos(latitude)`.
+   - The step halves with every zoom level, so particles move at the **same speed on screen** at any zoom.
+3. **Draw** a line from its old position to its new one (both converted to pixels with `map.project`).
+4. **Age it.** After a random lifetime, or when it leaves the grid, it **respawns** at a random visible spot. Random
+   lifetimes keep particles from all dying at the same moment.
+
+**Trails without storing history:** instead of clearing the canvas each frame, it's **faded** by 8%
+(`destination-in` compositing keeps existing pixels at 92% opacity). Each line segment fades out over about 30
+frames, which produces the streaks. While the map is moving, the canvas is cleared completely, so trails don't
+smear across the screen.
+
+**Performance decisions:**
+
+- Particles are stored in **typed arrays** (`Float32Array`) instead of objects: compact, with no per-particle allocation.
+- Segments are grouped into **4 speed colors**, each drawn with **one** `stroke()` call. That's 4 draw calls per frame instead of 3,000.
+- **Particle count scales with screen area** (about 3,000 on a laptop, about 800 on a phone).
+- The canvas resolution is capped at **2× pixel density**: Retina-sharp without 9× the pixels on 3× phone screens.
+- `requestAnimationFrame` pauses automatically in background tabs.
+
+**Known limits:** the wind field covers 6–36°N and 68–98°E, so particles stop at that edge. It's also the *current*
+wind only; playback animates AQI but not historical wind.
+
+**Bug found:** at first the canvas was **0 × 0 pixels**. It was sized from MapLibre's inner marker container,
+which has no size of its own. It's now sized from the map's root element. A Puppeteer check now counts how many canvas pixels are
+non-transparent (about 45,000 on a laptop screen), so "the wind is drawing" is tested, not assumed.
+
+## Q33. How does data reach the screen?
+
+- **Polling every 5 minutes** (wind every 30). The data changes every 30 minutes at most, so WebSockets (a permanent
+  connection that pushes updates) would add complexity for nothing. Polling is the right tool for slowly changing data.
+- **Keep the last good data on error:** a failed refresh doesn't blank the map. An error banner appears only if
+  there has *never* been data (usually meaning the API isn't running).
+- **AbortController:** if you open Delhi and then Mumbai before Delhi's history arrives, Delhi's request is cancelled,
+  so stale data can't overwrite fresh data. This is a classic race condition in UIs.
+- **Playback** reuses the same markers: `timeIndex = null` means live; otherwise each marker shows `timeline.aqi[timeIndex]`.
+  Moving the slider updates numbers and colors without rebuilding anything.
+- **Animated numbers** count from the old value to the new one, so changes are noticeable instead of silent.
+
+## Q34. Accessibility and phones
+
+- **Reduced motion:** if the operating system's "reduce motion" setting is on, wind particles start **off** and the pulses and shimmer stop.
+  Constant motion can cause discomfort for some people, so this is about access, not just style.
+- **The map isn't the only way in:** the ranked city list provides the same information with the keyboard (Tab, Enter),
+  and **Esc** closes the panel.
+- **Labels:** markers are real `<button>` elements with labels like "Delhi: AQI 305, Very Poor". The slider announces the
+  selected time, not just a number.
+- **Color isn't the only signal:** every marker shows its number, and the panel names the category in words.
+- **Phones (≤ 760 px):** the sidebar becomes a compact header with a horizontally scrolling city row, and the panel becomes a
+  bottom sheet. Space is left for the phone's home indicator.
+
+## Q35. Bugs from tooling: dependency skew and flaky screenshots
+
+**Dependency skew.** `framer-motion` was pinned to exactly 12.18.1, but it depends on `motion-dom` with a **range**
+(`^12.18.1`), so npm installed the newest match, 12.43.0, released more than a year later. That version had removed a
+function framer-motion 12.18.1 imports, and the build failed. The fix: npm **`overrides`**, pinning the inner
+packages to the versions released together. **Lesson:** pinning your own dependencies doesn't pin *their* dependencies.
+Lockfiles (`package-lock.json`, which is committed) and overrides control the whole tree.
+
+**Flaky screenshots.** Plain headless-Chrome screenshots were sometimes blank, because they were taken before the map
+finished loading. Switching to **Puppeteer** (scripted Chrome) fixed it: wait until markers exist, wait until the wind
+canvas exists, count drawn pixels, then screenshot. **Lesson:** a test that sometimes passes and sometimes fails is worse
+than no test. Wait for conditions, not for fixed amounts of time.
+
+## Q36. How is it tested?
+
+| Layer | Tool | What's covered |
+|---|---|---|
+| API | pytest + FastAPI `TestClient` | Every endpoint against a **temporary database**: latest-row logic, flagged data hidden, 404s, 422 validation, wind cache, stale-on-error, 503 |
+| Wind math | Vitest | Bilinear interpolation: exact at grid points, linear in between, null outside |
+| Whole app | Puppeteer (manual check) | Markers render, the wind canvas draws, the panel opens with charts, no console errors, desktop and phone |
+
+**Two testing techniques worth knowing:**
+
+- **Dependency override:** tests replace `get_conn` with a function that opens a temporary database. The endpoint code is
+  unchanged and doesn't know it's being tested.
+- **Monkeypatching:** tests replace `_fetch_wind` with a fake that returns a fixed grid or raises an error, so the cache
+  and error paths are tested **without the network**.
+
+**Not automated yet:** visual appearance. The screenshots in `docs/images/` are the record. Automated visual-regression
+tests could come with the Phase 7 deployment work.
+
 # Code reference: every function
 
 ## `aqi_india/config.py`
@@ -566,6 +818,8 @@ reproduces the exact situation so the bug can't return unnoticed.
 - **`fetch_air_quality(cities, past_days=2)`**: hourly pollutants, forecast hours dropped, converted to long format;
   CO converted from µg/m³ to mg/m³.
 - **`fetch_weather(cities)`**: current temperature, humidity, wind, pressure, rain and clouds, one row per city.
+- **`fetch_wind_grid(lat_min, lat_max, lon_min, lon_max, step=2.0)`**: current 10 m wind on a regular grid over India,
+  converted from speed and direction to u/v components (Q27). Returns a JSON-ready dict.
 
 ## `aqi_india/fetchers/cpcb.py`
 
@@ -577,7 +831,7 @@ reproduces the exact situation so the bug can't return unnoticed.
 
 ## `aqi_india/db.py`
 
-- **`connect(path)`**: opens SQLite, creates tables, runs migrations.
+- **`connect(path, check_same_thread=True)`**: opens SQLite in WAL mode with a 10 s lock timeout, creates tables, runs migrations (Q26).
 - **`_migrate(conn)`**: adds columns that are missing from older databases (Q16).
 - **`upsert(conn, table, df)`**: idempotent insert-or-update keyed on each table's primary key (Q5).
 - **`_to_sql_values(df)`**: timestamps to ISO strings (including timestamps hidden in `object` columns, Q23),
@@ -618,3 +872,41 @@ reproduces the exact situation so the bug can't return unnoticed.
 
 - **`job()`**: one pipeline run, wrapped so a failure is logged and retried at the next interval instead of stopping the scheduler.
 - **`main()`**: APScheduler every 30 minutes, starting immediately, never overlapping runs, combining missed runs into one.
+
+## `aqi_india/api.py`: the HTTP API
+
+- **`app`**: the FastAPI application. Interactive docs at `/docs`.
+- **`get_conn()`**: dependency that gives each request its own database connection and always closes it (Q26).
+- **`health()`**: `GET /api/health`, liveness check plus the newest AQI timestamp.
+- **`cities(source)`**: `GET /api/cities`, latest AQI and weather per location, worst first.
+- **`overview(source)`**: `GET /api/overview`, national average, cities per category, worst and best.
+- **`city_history(location, hours, source)`**: `GET /api/cities/{location}/history`, hourly AQI and clean pollutant readings.
+- **`city_daily(location, days, source)`**: `GET /api/cities/{location}/daily`, daily summaries, oldest first.
+- **`timeline(hours, source)`**: `GET /api/timeline`, every city's hourly AQI on one shared time axis (parallel arrays, Q25).
+- **`wind()`**: `GET /api/wind`, the wind grid with a 1-hour cache, a lock, and stale-on-error (Q27).
+- **`_latest_cities(conn, source)`**: the "latest row per city" query joined with the latest weather.
+- **`_require_location(conn, location, source)`**: raises a 404 for unknown locations.
+- **`_since(hours)`**: ISO timestamp *hours* ago, in India time.
+- **`_fetch_wind()`**: thin wrapper so tests can replace the network call.
+- **Response models** (`CityNow`, `Weather`, `CityHistory`, `AqiPoint`, `ValuePoint`, `DailyRow`, `Timeline`,
+  `TimelineCity`, `Overview`, `WindGrid`): the API contract (Q24).
+- If `web/dist` exists, it's mounted at `/` so one process serves the whole app (Q28).
+
+## `web/src/`: the frontend
+
+- **`main.tsx`**: mounts `<App/>` into the page.
+- **`App.tsx`**: top-level state: selected city, playback position, play/pause, toggles. Polls the API and lazily loads the city panel (Q29, Q33).
+- **`api.ts`**: TypeScript mirrors of the API models, plus one fetch function per endpoint.
+- **`aqi.ts`**: AQI categories with colors, pulse speeds and health advice; `categoryInfo(aqi)`, `colorOf(aqi)`, pollutant labels with subscripts.
+- **`hooks.ts`**: `usePolling(fetcher, interval)` fetches and refreshes, keeping the last good data and cancelling on unmount;
+  `usePrefersReducedMotion()`; `formatTime(iso)` in India time.
+- **`components/MapView.tsx`**: creates the MapLibre map once; keeps one HTML marker per city in sync with live or playback AQI;
+  manages the smog-glow layer; flies to the selected city (Q30, Q31).
+- **`components/WindLayer.tsx`**: the particle system (Q32). `sampleWind(grid, lon, lat)` does the bilinear interpolation, exported for tests.
+- **`components/CityPanel.tsx`**: the city detail panel: animated AQI, advice, sub-index bars, weather, a 72-hour chart
+  with a category-colored gradient (`categoryStops`), and daily bars with low-coverage days faded.
+- **`components/Sidebar.tsx`**: brand, national average, category distribution bar, ranked city list (animated reordering), toggles.
+- **`components/TimelineBar.tsx`**: play/pause, a time slider, and a *Live* button.
+- **`components/AnimatedNumber.tsx`**: a number that counts smoothly from its previous value to the new one.
+- **`styles.css`**: dark theme tokens, glass panels, marker pulse animation, the phone layout, reduced-motion rules.
+- **`components/WindLayer.test.ts`**: Vitest tests for `sampleWind`.

@@ -132,9 +132,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def connect(path: Path = DB_PATH) -> sqlite3.Connection:
+def connect(path: Path = DB_PATH, check_same_thread: bool = True) -> sqlite3.Connection:
+    """Open the database, creating tables and running migrations if needed.
+
+    check_same_thread=False lets the API hand a connection between threads
+    (FastAPI may run a dependency and its endpoint on different worker threads).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, check_same_thread=check_same_thread, timeout=10)
+    # WAL mode: readers (the API) don't block the writer (the scheduler) and vice
+    # versa. The setting is stored in the database file, so setting it once is enough.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn
