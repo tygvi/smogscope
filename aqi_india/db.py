@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS air_quality (
     value       REAL NOT NULL,
     unit        TEXT NOT NULL,
     fetched_at  TEXT NOT NULL,
+    flag        TEXT NOT NULL DEFAULT 'ok',   -- ok | suspect | invalid (quality.py)
+    flag_reason TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (source, location, observed_at, pollutant)
 );
 
@@ -75,10 +77,30 @@ PRIMARY_KEYS = {
 }
 
 
+# Columns added after a table was first created. CREATE TABLE IF NOT EXISTS does
+# nothing for a table that already exists, so older databases need these added.
+MIGRATIONS = {
+    "air_quality": {
+        "flag": "TEXT NOT NULL DEFAULT 'ok'",
+        "flag_reason": "TEXT NOT NULL DEFAULT ''",
+    },
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, columns in MIGRATIONS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+    conn.commit()
+
+
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -113,3 +135,33 @@ def upsert(conn: sqlite3.Connection, table: str, df: pd.DataFrame) -> int:
 
 def read_sql(conn: sqlite3.Connection, query: str, params: tuple = ()) -> pd.DataFrame:
     return pd.read_sql_query(query, conn, params=params)
+
+
+def read_air_quality_since(conn: sqlite3.Connection, since: pd.Timestamp) -> pd.DataFrame:
+    """All air-quality readings observed at or after `since`, with tz-aware timestamps.
+
+    Comparing ISO strings works because every stored timestamp has the same
+    format and +05:30 offset (see design-qa.md, Q8 gotcha); `since` is converted
+    to that same form first.
+    """
+    since_str = since.tz_convert("Asia/Kolkata").isoformat()
+    df = read_sql(conn, "SELECT * FROM air_quality WHERE observed_at >= ?", (since_str,))
+    df["observed_at"] = pd.to_datetime(df["observed_at"], format="ISO8601").dt.tz_convert("Asia/Kolkata")
+    return df
+
+
+def update_flags(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
+    """Write quality flags back onto existing air_quality rows."""
+    if df.empty:
+        return 0
+    rows = (
+        (r.flag, r.flag_reason, r.source, r.location, r.observed_at.isoformat(), r.pollutant)
+        for r in df.itertuples(index=False)
+    )
+    with conn:
+        conn.executemany(
+            "UPDATE air_quality SET flag = ?, flag_reason = ? "
+            "WHERE source = ? AND location = ? AND observed_at = ? AND pollutant = ?",
+            rows,
+        )
+    return len(df)

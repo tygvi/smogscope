@@ -38,6 +38,10 @@ POLLUTANT_MAP = {
 }
 
 
+class CPCBResponseError(RuntimeError):
+    """data.gov.in answered, but not with usable JSON (an expected, temporary failure)."""
+
+
 def _session() -> requests.Session:
     """A session that automatically retries when data.gov.in has a bad moment.
 
@@ -69,7 +73,7 @@ def _fetch_all_records(api_key: str, page_size: int, max_pages: int) -> list[dic
         try:
             payload = resp.json()
         except ValueError as e:
-            raise RuntimeError(
+            raise CPCBResponseError(
                 f"data.gov.in returned non-JSON (HTTP {resp.status_code}): {resp.text[:200]!r}"
             ) from e
         batch = payload.get("records", [])

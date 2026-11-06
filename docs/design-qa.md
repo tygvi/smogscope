@@ -299,3 +299,206 @@ almost certainly a stuck sensor.
 | **A: Handling** | Keep all raw data; add `flag` + `flag_reason`; exclude or interpolate only at read time |
 | **B: Placement** | Validation at ingestion; quality checks as a separate, re-runnable step after storage |
 | **C: Stuck sensor** | 6 or more identical consecutive hourly values above a minimum level, both configurable, later tuned on real data |
+
+## Q12. How were the thresholds chosen?
+
+**Upper limits (`MAX_PLAUSIBLE`):** a value above these is *impossible*, so it's flagged `invalid`.
+
+| Pollutant | Limit | Reasoning |
+|---|---|---|
+| PM2.5 | 1500 µg/m³ | Delhi's worst hourly peaks (Diwali night, November smog) approach ~1000, plus a margin |
+| PM10 | 3000 µg/m³ | Desert dust storms push hourly PM10 well past 1000 |
+| NO₂ | 1000 µg/m³ | Even roadside hourly values rarely exceed a few hundred |
+| SO₂ | 2000 µg/m³ | Spikes near smelters and coal plants; CPCB's "Severe" band starts at 1600 |
+| CO | 50 mg/m³ | "Severe" starts at 34; heavy-traffic peaks are typically below 20 |
+| O₃ | 1000 µg/m³ | Extreme urban hourly ozone stays well below this |
+| NH₃ | 3000 µg/m³ | "Severe" starts at 1800 |
+
+**Why so generous?** The range check catches **garbage** (99999, or a unit mix-up that multiplies a value by 1000),
+not *bad air*. If the limit were tight, a genuinely terrible Diwali night would get flagged `invalid` and hidden,
+which is the worst possible mistake for a pollution dashboard. *Unlikely-but-possible* values are handled by
+other checks and by the CPCB comparison.
+
+**Example from the real data:** Open-Meteo reported Mumbai O₃ at 523 µg/m³. That passes the range check, correctly:
+it's implausible for Mumbai but not physically impossible. That kind of error is **model bias**, and it's caught by
+comparing against measurements, not by fixed limits.
+
+**Stuck minimum levels (`STUCK_MIN_LEVEL`):** set at about the lower half of each pollutant's "Good" band
+(PM2.5 15, PM10 25, NO₂ 15, SO₂ 15, CO 0.5, O₃ 20, NH₃ 50). Below these, repeated values are believable:
+the air is clean and stable, and rounded readings come out the same.
+
+**Status:** both tables are *first guesses*, documented and configurable. They'll be revised with real CPCB history (Q11).
+
+# Phase 2: How the code works
+
+## Q13. How does `check_stuck` find runs of identical values?
+
+This is the hardest function in the project so far. It uses a common pandas technique: **run-length
+encoding with `shift()` and `cumsum()`**, which avoids writing a Python loop.
+
+**Step by step, on one sensor's data:**
+
+| Time | Value | Same series? | Same value as previous? | Exactly 1 h later? | `new_run` | `run_id` (cumsum) | Run length |
+|---|---|---|---|---|---|---|---|
+| 00:00 | 90 | — | — | — | True | 1 | 1 |
+| 01:00 | 118 | ✓ | ✗ | ✓ | True | 2 | 6 |
+| 02:00 | 118 | ✓ | ✓ | ✓ | False | 2 | 6 |
+| 03:00 | 118 | ✓ | ✓ | ✓ | False | 2 | 6 |
+| 04:00 | 118 | ✓ | ✓ | ✓ | False | 2 | 6 |
+| 05:00 | 118 | ✓ | ✓ | ✓ | False | 2 | 6 |
+| 06:00 | 118 | ✓ | ✓ | ✓ | False | 2 | 6 |
+| 07:00 | 95 | ✓ | ✗ | ✓ | True | 3 | 1 |
+
+1. **Sort** by `source, location, pollutant, observed_at`, so each sensor's readings sit together in time order.
+2. Compare every row with the previous one using `shift()`. A row *continues* a run only if it's the **same
+   series**, has the **same value**, and is **exactly one hour later**. Otherwise `new_run = True`.
+3. `new_run.cumsum()` counts the True values so far. Since True counts as 1, the counter goes up exactly when a new run
+   starts, so every run gets its own ID.
+4. `groupby(run_id).transform("size")` gives every row the length of its run.
+5. Flag = run length ≥ 6 **and** value above the minimum level.
+6. `reindex(df.index)` puts the answers back in the caller's original row order.
+
+**The bugs that the step-2 conditions prevent (each one has a test):**
+
+- Without the **same-series** check, Delhi's last three readings and Mumbai's first three would merge into one "run" of 6.
+- Without the **one-hour** check, `118` at 00:00–02:00 followed by `118` at 04:00–06:00 would look like 6 in a row,
+  even though there's a gap.
+- Without step 6, the flags would be in *sorted* order and get attached to the wrong rows. The shuffled-input test catches this.
+
+**Why vectorized and not a loop:** a Python `for` loop over a million rows takes seconds; these pandas
+operations run in compiled code and take milliseconds. It's also how you'd write it in SQL (window functions),
+which helps when this moves to PostgreSQL.
+
+## Q14. How does `check_pm_ratio` compare two pollutants in long-format data?
+
+PM2.5 and PM10 are on **different rows**, so they can't be compared directly. The function does a
+**long → wide → long round trip** (the "store long, analyze wide" rule from Q4):
+
+1. Keep only PM rows, then `pivot_table` with index `(source, location, observed_at)` and columns `PM2.5`, `PM10`.
+2. Compare the columns: `wide["PM2.5"] > wide["PM10"]` gives the *keys* (source, location, time) that are bad.
+3. Build the same key for every original row (`MultiIndex.from_frame`) and check membership with `isin`.
+4. `& is_pm`: only PM rows are flagged, since NO₂ at the same time did nothing wrong.
+
+**Both** PM rows are flagged, because we can't tell which sensor is wrong. Readings at **different times**
+are never compared; the pivot puts them on different rows.
+
+## Q15. How does `assess` combine the checks?
+
+`CHECKS` is a list of `(function, flag, reason)` entries ordered **from least to most severe**:
+`stuck` and `pm25_gt_pm10` (suspect), then `out_of_range` (invalid).
+
+- Each check's hits overwrite `flag`, so a later, more severe flag wins: **invalid beats suspect beats ok**,
+  without any `if` statements.
+- Reasons are **accumulated**, not overwritten: a PM2.5 of 5000 that's also above PM10 gets
+  `"pm25_gt_pm10,out_of_range"`, so you can see every problem.
+- It returns a **copy**; the input DataFrame isn't changed (tested).
+- It refuses a DataFrame with a duplicate index, because every check aligns its results by index. Duplicates would
+  attach flags to the wrong rows silently. Raising an error early is better.
+
+**Why a list of checks instead of three hard-coded calls:** adding a new check (for example, spike detection) is one new
+line in `CHECKS`. This is a small example of the *open–closed principle*: open to extension, closed to modification.
+
+## Q16. How is quality wired into the pipeline?
+
+`run_once()` now runs: **ingest → assess → write flags → AQI from clean data only → store AQI**.
+
+- **Schema:** `air_quality` gained `flag` (default `'ok'`) and `flag_reason`.
+- **Migration:** `CREATE TABLE IF NOT EXISTS` does nothing to a table that *already exists*, so the existing
+  database wouldn't get the new columns. `db._migrate()` reads `PRAGMA table_info` and runs
+  `ALTER TABLE … ADD COLUMN` for anything missing. This is a hand-written version of what migration tools
+  (Alembic, Flyway) do. We'll use a real one with PostgreSQL in a later phase.
+- **The 72-hour window:** each run re-reads the last 72 hours and re-assesses them. That's long enough for the 6-hour
+  stuck check and the 24-hour AQI window. Re-assessing (not only the new rows) matters because a run can become
+  "stuck" only *after* its sixth hour arrives, which flags the five earlier hours retroactively.
+- **AQI uses only `flag == "ok"`.** Flagged data stays in the database (Q9) but no longer affects the AQI.
+- **A bug fixed along the way:** `aqi_from_station_averages` used to average *all* CPCB rows it was given. That was
+  harmless while it only received the latest snapshot, but now it receives 72 hours of history. It now takes the
+  **latest** value per pollutant. Changing the input of a function can break its assumptions.
+
+## Q17. Follow-up to Q6: which exceptions does the pipeline catch now?
+
+Q6 pointed out that catching `Exception` hides bugs. Now:
+
+- `requests.RequestException` (timeouts, connection errors, HTTP 5xx after retries) and the new
+  `CPCBResponseError` (the server answered with something other than JSON) are **expected**: logged, and the run continues.
+- **Anything else** (a `KeyError` from a renamed field, a bug in our parsing) **crashes the run**, so it gets noticed and fixed.
+
+A custom exception class (`CPCBResponseError`) lets the code catch *exactly* that failure, which a generic
+`RuntimeError` can't do safely.
+
+## Q18. First real result and an open question
+
+The first run with quality checks: **6,294 ok, 6 suspect**. All 6 were **Chennai O₃ at exactly 36.0 for 6 hours** overnight.
+
+The check worked as designed, but Open-Meteo is a **model**, not a sensor, so there's no hardware to be stuck.
+Its ozone values come rounded to whole numbers and can flatten out on a calm night. This is probably a
+**false positive**.
+
+**Open question (to decide with more data):** should the stuck check apply only to **measured** sources (CPCB)?
+Arguments for: the check exists to catch sensor faults. Arguments against: a flat model output can also signal
+a broken model feed. For now the rule is unchanged and the case is recorded here, instead of being quietly special-cased.
+
+# Code reference: every function
+
+## `aqi_india/config.py`
+
+- **`City`**: a frozen dataclass (name, state, lat, lon). *Frozen* means immutable, so it can't be changed by accident.
+- **`CITIES`**: the 15 tracked cities. **`DB_PATH`**, **`TIMEZONE`**, **`DATA_GOV_API_KEY`** (read from `.env`).
+
+## `aqi_india/aqi.py`: the CPCB AQI
+
+- **`sub_index(pollutant, concentration)`**: finds the breakpoint band and interpolates linearly to a 0–500
+  sub-index. Returns `None` for missing or negative input, 500 above the top band, and raises for unknown pollutants.
+- **`category(aqi)`**: maps a number to Good, Satisfactory, Moderate, Poor, Very Poor or Severe.
+- **`compute_aqi(concentrations)`**: sub-index for each pollutant, the max is the AQI, and that pollutant is dominant. Returns `None` unless
+  at least 3 pollutants including PM2.5 or PM10 are available (Q1).
+- **`concentrations_from_hourly(hourly)`**: 24-hour means (requiring 16 valid hours) and the max 8-hour rolling mean for CO and O₃ (Q2).
+- **`_round_half_up(x)`**: rounding that sends .5 upward, unlike Python's `round()` (Q3).
+- **`AQIResult`**: the result: aqi, category, dominant pollutant, all sub-indices.
+
+## `aqi_india/fetchers/open_meteo.py`
+
+- **`_get(url, cities, params)`**: one batched request for all cities (Q7); wraps a single result in a list.
+- **`fetch_air_quality(cities, past_days=2)`**: hourly pollutants, forecast hours dropped, converted to long format;
+  CO converted from µg/m³ to mg/m³.
+- **`fetch_weather(cities)`**: current temperature, humidity, wind, pressure, rain and clouds, one row per city.
+
+## `aqi_india/fetchers/cpcb.py`
+
+- **`_session()`**: an HTTP session that retries 429/5xx responses with exponential backoff.
+- **`_fetch_all_records(api_key, page_size, max_pages)`**: paginates with `limit`/`offset` until `total` records are fetched.
+- **`fetch_cpcb(api_key)`**: parses records into the same long format as Open-Meteo; handles old and new field
+  names, `"NA"` values, and `dd-mm-yyyy` timestamps.
+- **`CPCBResponseError`**: raised when the server returns something other than JSON (Q17).
+
+## `aqi_india/db.py`
+
+- **`connect(path)`**: opens SQLite, creates tables, runs migrations.
+- **`_migrate(conn)`**: adds columns that are missing from older databases (Q16).
+- **`upsert(conn, table, df)`**: idempotent insert-or-update keyed on each table's primary key (Q5).
+- **`_to_sql_values(df)`**: timestamps to ISO strings, numpy values to Python values, NaN to NULL.
+- **`read_sql(conn, query, params)`**: a query returned as a DataFrame.
+- **`read_air_quality_since(conn, since)`**: readings in a time window, with timestamps parsed back to tz-aware values.
+- **`update_flags(conn, df)`**: writes `flag` and `flag_reason` back onto existing rows.
+
+## `aqi_india/quality.py`
+
+- **`check_range(df)`**: negative or above `MAX_PLAUSIBLE`, giving invalid (Q12).
+- **`check_stuck(df, min_run, min_level)`**: identical consecutive hourly runs above a minimum level, giving suspect (Q13).
+- **`check_pm_ratio(df)`**: PM2.5 > PM10 at the same place and time, giving suspect (Q14).
+- **`assess(df)`**: runs all checks and adds `flag` and `flag_reason` (Q15).
+- **`_all_false(df)`**: helper that returns an all-False result for empty or irrelevant input.
+
+## `aqi_india/pipeline.py`
+
+- **`run_once()`**: ingest, assess, write flags, AQI from clean data, store (Q16).
+- **`_ingest(conn)`**: fetches and stores every source; skips CPCB on expected failures only (Q17).
+- **`aqi_from_hourly(readings)`**: AQI per location from hourly data (Open-Meteo).
+- **`aqi_from_station_averages(readings)`**: AQI per CPCB station from the latest published values.
+- **`_aqi_row(...)`**: builds one row of the `aqi` table.
+- **`main()`**: command-line entry point; prints the summary table.
+
+## `aqi_india/scheduler.py`
+
+- **`job()`**: one pipeline run, wrapped so a failure is logged and retried at the next interval instead of stopping the scheduler.
+- **`main()`**: APScheduler every 30 minutes, starting immediately, never overlapping runs, combining missed runs into one.
