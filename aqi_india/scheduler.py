@@ -40,6 +40,12 @@ def main() -> None:
         misfire_grace_time=None,       # ...however late it is. The default (1 s) silently
                                        # DROPS late runs, so after sleep nothing ran (Q38).
     )
+    # Heartbeat: a no-op every minute. The scheduler waits using a monotonic clock,
+    # which on macOS does NOT advance while the computer sleeps, so after an overnight
+    # sleep it would keep waiting ~30 more awake minutes before noticing the main job
+    # is overdue. Waking every minute makes it re-check the real clock promptly (Q38).
+    scheduler.add_job(lambda: None, "interval", minutes=1, id="heartbeat", misfire_grace_time=None, coalesce=True)
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)  # don't log 1,440 heartbeats a day
     log.info("Scheduler started: every %d min. Ctrl+C to stop.", INTERVAL_MINUTES)
     try:
         scheduler.start()

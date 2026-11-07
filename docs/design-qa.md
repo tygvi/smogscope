@@ -862,6 +862,13 @@ because a run that is too late is discarded before coalescing.
 **Fix:** `misfire_grace_time=None` (no limit) together with `coalesce=True`. However late it is, exactly **one** catch-up
 run happens after waking, followed by the normal 30-minute rhythm.
 
+**Part 2, found the next morning:** after an overnight sleep, the catch-up *still* didn't run on waking. APScheduler waits for the
+next job with a timer based on a **monotonic clock** (one that never jumps backwards when the wall clock changes). On
+macOS, that clock **doesn't advance while the computer sleeps**. After waking, the scheduler still believed it had ~25
+minutes left to wait, measured in *awake* time. The fix is a **heartbeat**: a no-op job every minute, so the scheduler never
+waits more than one minute of awake time before re-checking the real clock and noticing the overdue run.
+(Its log lines are silenced to avoid 1,440 "heartbeat ran" messages a day.)
+
 **Lessons:**
 
 - **Read the defaults of anything that schedules work.** "Silently skip" is a dangerous default, and nothing was logged as an error.
@@ -949,7 +956,7 @@ run happens after waking, followed by the normal 30-minute rhythm.
 ## `aqi_india/scheduler.py`
 
 - **`job()`**: one pipeline run, wrapped so a failure is logged and retried at the next interval instead of stopping the scheduler.
-- **`main()`**: APScheduler every 30 minutes, starting immediately, never overlapping runs; after sleep or downtime, exactly one catch-up run however late (`coalesce=True`, `misfire_grace_time=None`, Q38).
+- **`main()`**: APScheduler every 30 minutes, starting immediately, never overlapping runs; after sleep or downtime, exactly one catch-up run however late (`coalesce=True`, `misfire_grace_time=None`), plus a 1-minute heartbeat so the catch-up happens promptly after waking (Q38).
 
 ## `aqi_india/api.py`: the HTTP API
 
