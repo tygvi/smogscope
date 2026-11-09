@@ -1,0 +1,70 @@
+# SmogScope: the whole system as three containers.
+#
+#   docker compose up -d --build     build our image and start everything
+#   docker compose logs -f           watch the logs (Ctrl+C stops watching, not the app)
+#   docker compose down              stop (the database volume is kept)
+#
+# Settings come from .env next to this file (never committed):
+#   POSTGRES_PASSWORD   database password (letters and digits only)
+#   DATA_GOV_API_KEY    CPCB key from data.gov.in
+#   WEB_PORT            where the site is published: 8080 on your Mac, 80 on the server
+
+name: smogscope
+
+# Shared settings for the two containers that run OUR image ("x-" blocks are
+# reusable snippets; "<<: *app" pastes this block into a service).
+x-app: &app
+  build: .
+  image: smogscope-app
+  restart: unless-stopped           # come back after a crash or a server reboot
+  environment:
+    # "db" is the database container's name: Compose's private network resolves it.
+    SMOGSCOPE_PG_DSN: host=db dbname=smogscope user=smogscope password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    DATA_GOV_API_KEY: ${DATA_GOV_API_KEY:-}
+    TZ: Asia/Kolkata
+  depends_on:
+    db:
+      condition: service_healthy    # wait until PostgreSQL actually accepts connections
+
+services:
+  db:
+    image: postgres:17-alpine       # official image, downloaded from Docker Hub
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: smogscope
+      POSTGRES_USER: smogscope
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      TZ: Asia/Kolkata
+    volumes:
+      # The data lives in a named volume, so removing or upgrading the container keeps it.
+      - pgdata:/var/lib/postgresql/data
+      # On the FIRST start (empty volume) the image runs every .sql file here in name
+      # order: 001_schema, 002_silver_measure, 003_gold_views. Later migrations must be
+      # applied by hand, because this only happens once.
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    # No "ports": the database is reachable only from the other two containers.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smogscope -d smogscope"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  scheduler:
+    <<: *app
+    command: ["python", "-m", "aqi_india.scheduler"]   # same image, different job
+
+  web:
+    <<: *app
+    ports:
+      # your computer's port -> the container's port 8000.
+      # WEB_BIND=127.0.0.1 (default): only this computer can open the site, not others on
+      # the same Wi-Fi. On the server set WEB_BIND=0.0.0.0 so visitors can reach it.
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8080}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  pgdata:

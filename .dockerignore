@@ -1,0 +1,23 @@
+# Files Docker must NOT copy into the image (like .gitignore, but for `docker build`).
+
+# Secrets: never bake API keys or passwords into an image
+.env
+.env.*
+!.env.example
+
+# Rebuilt inside the image (and your Mac's versions would not work on Linux anyway)
+.venv/
+web/node_modules/
+web/dist/
+
+# Not needed to run the app; leaving them out keeps builds small and fast
+.git/
+data/
+logs/
+docs/
+tests/
+scripts/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.DS_Store
