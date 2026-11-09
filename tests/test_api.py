@@ -1,57 +1,50 @@
-"""Tests for the FastAPI app, against a small throwaway database."""
-import json
+"""Tests for the FastAPI app, against a throwaway PostgreSQL database.
 
-import pandas as pd
+The schema comes from the real migrations (sql/001-003), so the tests also prove
+the migrations work on an empty database. Skipped if PostgreSQL isn't running.
+"""
+import psycopg
 import pytest
 import requests
 from fastapi.testclient import TestClient
+from psycopg.rows import dict_row
 
-from aqi_india import api, db
+from aqi_india import api
+from aqi_india.config import PROJECT_ROOT, TIMEZONE
 
-TZ = "Asia/Kolkata"
+TEST_DB = "smogscope_test"
+MIGRATIONS = sorted((PROJECT_ROOT / "sql").glob("[0-9][0-9][0-9]_*.sql"))
+
+
+@pytest.fixture(scope="session")
+def test_dsn():
+    try:
+        admin = psycopg.connect("dbname=postgres", autocommit=True)
+    except psycopg.OperationalError:
+        pytest.skip("PostgreSQL is not running")
+    with admin:
+        admin.execute(f"DROP DATABASE IF EXISTS {TEST_DB} WITH (FORCE)")
+        admin.execute(f"CREATE DATABASE {TEST_DB}")
+    dsn = f"dbname={TEST_DB}"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        for path in MIGRATIONS:
+            conn.execute(path.read_text())
+    yield dsn
+    with psycopg.connect("dbname=postgres", autocommit=True) as admin:
+        admin.execute(f"DROP DATABASE IF EXISTS {TEST_DB} WITH (FORCE)")
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    path = tmp_path / "api.db"
-    conn = db.connect(path)
-    now = pd.Timestamp.now(tz=TZ).floor("h")
-    hours = [now - pd.Timedelta(hours=h) for h in (2, 1, 0)]
-
-    def aqi_rows(location, lat, lon, values, category, dominant):
-        return pd.DataFrame({
-            "source": "open-meteo", "location": location, "state": "S", "lat": lat, "lon": lon,
-            "observed_at": hours, "aqi": values, "category": category,
-            "dominant_pollutant": dominant, "sub_indices": json.dumps({dominant: values[-1]}),
-        })
-
-    db.upsert(conn, "aqi", pd.concat([
-        aqi_rows("Delhi", 28.6, 77.2, [300, 310, 320], "Very Poor", "PM2.5"),
-        aqi_rows("Chennai", 13.1, 80.3, [60, 55, 50], "Good", "O3"),
-    ], ignore_index=True))
-    db.upsert(conn, "air_quality", pd.DataFrame({
-        "source": "open-meteo", "location": "Delhi", "state": "S", "lat": 28.6, "lon": 77.2,
-        "observed_at": hours, "pollutant": "PM2.5", "value": [150.0, 9999.0, 160.0], "unit": "µg/m³",
-    }))
-    conn.execute("UPDATE air_quality SET flag = 'invalid' WHERE value = 9999.0")
-    db.upsert(conn, "weather", pd.DataFrame({
-        "source": "open-meteo", "location": ["Delhi"], "state": "S", "lat": 28.6, "lon": 77.2,
-        "observed_at": [hours[-1]], "temperature_c": [24.5], "humidity_pct": [60.0],
-        "wind_speed_kmh": [5.0], "wind_dir_deg": [300.0], "pressure_hpa": [1010.0],
-        "precipitation_mm": [0.0], "cloud_cover_pct": [10.0],
-    }))
-    db.upsert(conn, "daily_summary", pd.DataFrame({
-        "source": "open-meteo", "location": "Delhi", "date": ["2026-11-05", "2026-11-06"],
-        "state": "S", "lat": 28.6, "lon": 77.2, "aqi_mean": [320.0, 310.0], "aqi_min": [300, 290],
-        "aqi_max": [340, 330], "aqi_hours": [24, 20], "dominant_pollutant": "PM2.5",
-        "worst_category": "Very Poor", "readings_total": [144, 120], "readings_ok": [144, 118],
-        "pct_ok": [100.0, 98.3],
-    }))
-    conn.commit()
-    conn.close()
+def client(test_dsn):
+    with psycopg.connect(test_dsn, autocommit=True) as conn:
+        conn.execute("TRUNCATE gold.aqi_hourly, gold.daily_summary, gold.daily_pollutant,"
+                     " silver.air_quality, silver.weather, silver.location, bronze.ingest_run CASCADE")
+        conn.execute(f"SET TIME ZONE '{TIMEZONE}'")
+        _seed(conn)
 
     def get_test_conn():
-        c = db.connect(path, check_same_thread=False)
+        c = psycopg.connect(test_dsn, autocommit=True, row_factory=dict_row)
+        c.execute(f"SET TIME ZONE '{TIMEZONE}'")
         try:
             yield c
         finally:
@@ -64,27 +57,86 @@ def client(tmp_path, monkeypatch):
     api._wind_cache.clear()
 
 
-def test_cities_latest_worst_first_with_weather(client):
+def _seed(conn):
+    """Delhi: 3 model hours + 1 nearby station now (-> measured).
+    Chennai: 3 model hours, no station nearby (-> estimated).
+    One more station far from every city."""
+    def loc(kind, name, city, lat, lon):
+        return conn.execute(
+            "INSERT INTO silver.location (kind, name, city, state, lat, lon) VALUES (%s, %s, %s, 'S', %s, %s)"
+            " RETURNING location_id", (kind, name, city, lat, lon)).fetchone()[0]
+
+    delhi = loc("city", "Delhi", "Delhi", 28.6139, 77.2090)
+    chennai = loc("city", "Chennai", "Chennai", 13.0827, 80.2707)
+    near = loc("station", "Station A, Delhi", "Delhi", 28.62, 77.21)      # ~1 km from Delhi
+    far = loc("station", "Far Station", "Nowhere", 20.0, 75.0)           # no city within 25 km
+
+    hour = "date_trunc('hour', now()) - make_interval(hours => %s)"
+    for loc_id, values, cats in [
+        (delhi, [300, 310, 320], ["Very Poor", "Very Poor", "Very Poor"]),
+        (chennai, [60, 55, 50], ["Satisfactory", "Satisfactory", "Good"]),
+    ]:
+        for h, (v, cat) in zip((2, 1, 0), zip(values, cats)):
+            conn.execute(f"INSERT INTO gold.aqi_hourly (source, location_id, observed_at, aqi, category, dominant, pm25_si)"
+                         f" VALUES ('open-meteo', %s, {hour}, %s, %s, 'pm25', %s)", (loc_id, h, v, cat, v))
+    conn.execute(f"INSERT INTO gold.aqi_hourly (source, location_id, observed_at, aqi, category, dominant,"
+                 f" pm25_si, pm10_si, no2_si) VALUES ('cpcb', %s, {hour}, 350, 'Very Poor', 'pm25', 350, 200, 40)",
+                 (near, 0))
+    conn.execute(f"INSERT INTO gold.aqi_hourly (source, location_id, observed_at, aqi, category, dominant,"
+                 f" pm25_si, pm10_si, no2_si) VALUES ('cpcb', %s, {hour}, 100, 'Satisfactory', 'pm10', 80, 100, 20)",
+                 (far, 0))
+    for station, subs in [(near, {"pm25": 350, "pm10": 200, "no2": 40}), (far, {"pm25": 80, "pm10": 100, "no2": 20})]:
+        for pollutant, v in subs.items():
+            conn.execute(f"INSERT INTO silver.air_quality (source, location_id, pollutant, measure, observed_at, value)"
+                         f" VALUES ('cpcb', %s, %s, 'sub_index', {hour}, %s)", (station, pollutant, 0, v))
+
+    for h, v, flag in [(2, 150.0, "ok"), (1, 9999.0, "invalid"), (0, 160.0, "ok")]:
+        conn.execute(f"INSERT INTO silver.air_quality (source, location_id, pollutant, measure, observed_at, value, flag)"
+                     f" VALUES ('open-meteo', %s, 'pm25', 'concentration', {hour}, %s, %s::silver.quality_flag)",
+                     (delhi, h, v, flag))
+    conn.execute(f"INSERT INTO silver.weather (location_id, observed_at, temperature_c, humidity_pct,"
+                 f" wind_speed_kmh, wind_dir_deg) VALUES (%s, {hour}, 24.5, 60, 5, 300)", (delhi, 0))
+    conn.execute("INSERT INTO gold.daily_summary (source, location_id, day, mean_aqi, min_aqi, max_aqi,"
+                 " worst_category, hours_covered, pct_ok) VALUES"
+                 " ('open-meteo', %(d)s, '2026-11-05', 320, 300, 340, 'Very Poor', 24, 100),"
+                 " ('open-meteo', %(d)s, '2026-11-06', 310, 290, 330, 'Very Poor', 20, 98.3)", {"d": delhi})
+
+
+def test_cities_measured_beats_model(client):
     body = client.get("/api/cities").json()
     assert [c["location"] for c in body] == ["Delhi", "Chennai"]
-    assert body[0]["aqi"] == 320                      # latest hour, not the first
-    assert body[0]["sub_indices"] == {"PM2.5": 320}   # JSON text -> real object
-    assert body[0]["weather"]["temperature_c"] == 24.5
-    assert body[1]["weather"] is None                 # no weather row for Chennai
+    delhi, chennai = body
+    assert delhi["basis"] == "measured" and delhi["aqi"] == 350 and delhi["stations"] == 1
+    assert (delhi["measured_aqi"], delhi["model_aqi"], delhi["model_gap"]) == (350, 320, -30)
+    assert delhi["sub_indices"] == {"PM2.5": 350, "PM10": 200, "NO2": 40}     # station average
+    assert delhi["dominant_pollutant"] == "PM2.5"
+    assert delhi["weather"]["temperature_c"] == 24.5
+    assert chennai["basis"] == "estimated" and chennai["aqi"] == 50 and chennai["stations"] is None
+    assert chennai["sub_indices"] == {"PM2.5": 50}                            # model
+    assert chennai["weather"] is None
 
 
 def test_overview(client):
     body = client.get("/api/overview").json()
-    assert body["cities"] == 2
-    assert body["average_aqi"] == 185.0
+    assert (body["cities"], body["measured"]) == (2, 1)
+    assert body["average_aqi"] == 200.0
     assert body["counts_by_category"] == {"Very Poor": 1, "Good": 1}
     assert (body["worst"]["location"], body["best"]["location"]) == ("Delhi", "Chennai")
 
 
-def test_history_excludes_flagged_readings(client):
+def test_stations_lists_every_reporting_station(client):
+    body = {s["name"]: s for s in client.get("/api/stations").json()}
+    assert set(body) == {"Station A, Delhi", "Far Station"}
+    a = body["Station A, Delhi"]
+    assert (a["aqi"], a["category"], a["dominant_pollutant"]) == (350, "Very Poor", "PM2.5")
+    assert a["sub_indices"] == {"PM2.5": 350, "PM10": 200, "NO2": 40}
+
+
+def test_history_has_model_measured_and_clean_readings(client):
     body = client.get("/api/cities/Delhi/history?hours=6").json()
     assert [p["aqi"] for p in body["aqi"]] == [300, 310, 320]
-    assert [p["value"] for p in body["pollutants"]["PM2.5"]] == [150.0, 160.0]  # 9999 was invalid
+    assert [(m["aqi"], m["stations"]) for m in body["measured"]] == [(350, 1)]
+    assert [p["value"] for p in body["pollutants"]["PM2.5"]] == [150.0, 160.0]   # 9999 was invalid
     assert body["units"] == {"PM2.5": "µg/m³"}
 
 
@@ -100,14 +152,14 @@ def test_history_validates_hours(client):
 def test_daily_oldest_first(client):
     body = client.get("/api/cities/Delhi/daily?days=7").json()
     assert [d["date"] for d in body] == ["2026-11-05", "2026-11-06"]
-    assert body[1]["pct_ok"] == 98.3
+    assert body[1]["pct_ok"] == 98.3 and body[1]["aqi_hours"] == 20
 
 
-def test_timeline_shared_time_axis(client):
+def test_timeline_prefers_measured_hours(client):
     body = client.get("/api/timeline?hours=6").json()
     assert len(body["times"]) == 3
     by_city = {c["location"]: c["aqi"] for c in body["cities"]}
-    assert by_city == {"Delhi": [300, 310, 320], "Chennai": [60, 55, 50]}
+    assert by_city == {"Delhi": [300, 310, 350], "Chennai": [60, 55, 50]}    # last Delhi hour measured
 
 
 def _grid():

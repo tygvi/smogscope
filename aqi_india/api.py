@@ -1,63 +1,72 @@
-"""SmogScope HTTP API (FastAPI).
+"""SmogScope HTTP API (FastAPI), reading the PostgreSQL gold layer.
 
 Run (development):  uvicorn aqi_india.api:app --reload
 Interactive docs:   http://localhost:8000/docs
 
-The API is READ-ONLY over the database the scheduler fills. It never fetches
+The API is READ-ONLY over the warehouse the scheduler fills. It never fetches
 pollution data itself; the only outside call is the wind grid, which is cached.
 If the frontend has been built (web/dist), it is served at "/" too, so the whole
 app runs as one process in production.
+
+Measured vs. estimated: a city's headline AQI comes from gold.city_best, which
+uses the CPCB stations within 25 km when one reported in the last 2 hours, and
+the Open-Meteo model otherwise. Every city says which one it is (`basis`).
 """
 from __future__ import annotations
 
-import json
 import logging
-import sqlite3
 import threading
 import time
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Annotated
 
 import pandas as pd
+import psycopg
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
+from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-from aqi_india import db
-from aqi_india.config import DB_PATH, PROJECT_ROOT, TIMEZONE
+from aqi_india.config import PROJECT_ROOT, TIMEZONE
 from aqi_india.fetchers import open_meteo
+from aqi_india.pg import PG_DSN
+from aqi_india.silver import QUALITY_NAMES
 
 log = logging.getLogger(__name__)
 
 app = FastAPI(
     title="SmogScope API",
-    version="0.1.0",
-    description="Real-time air quality for Indian cities: official CPCB AQI method, hourly history, daily summaries, wind.",
+    version="0.2.0",
+    description="Air quality across India: CPCB station measurements merged with modeled estimates, "
+                "official CPCB AQI method, hourly history, daily summaries, wind.",
 )
 
-DEFAULT_SOURCE = open_meteo.SOURCE
-Source = Annotated[str, Query(description="Data source: 'open-meteo' (modeled) or 'cpcb' (stations)")]
+NAMES = QUALITY_NAMES                                  # "pm25" -> "PM2.5": the names the frontend uses
+SI_COLS = [f"{code}_si" for code in NAMES]
 
 
 # ---------------------------------------------------------------------------
 # Database dependency: one connection per request, always closed afterwards.
 # ---------------------------------------------------------------------------
 
-def get_conn() -> Iterator[sqlite3.Connection]:
-    conn = db.connect(DB_PATH, check_same_thread=False)
+def get_conn() -> Iterator[psycopg.Connection]:
+    # autocommit: every query is read-only, so there's no transaction to keep open.
+    # dict_row: rows come back as {"column": value} instead of tuples.
+    conn = psycopg.connect(PG_DSN, autocommit=True, row_factory=dict_row)
+    conn.execute(f"SET TIME ZONE '{TIMEZONE}'")        # timestamps come back in India time
     try:
         yield conn
     finally:
         conn.close()
 
 
-Conn = Annotated[sqlite3.Connection, Depends(get_conn)]
+Conn = Annotated[psycopg.Connection, Depends(get_conn)]
 
 
 # ---------------------------------------------------------------------------
-# Response models: the API's contract with the frontend. FastAPI validates
-# every response against these and publishes them in /docs.
+# Response models: the API's contract with the frontend (web/src/api.ts).
 # ---------------------------------------------------------------------------
 
 class Weather(BaseModel):
@@ -75,16 +84,45 @@ class CityNow(BaseModel):
     observed_at: str
     aqi: int
     category: str
-    dominant_pollutant: str
-    sub_indices: dict[str, int]
+    basis: str                      # "measured" (CPCB stations) | "estimated" (model)
+    dominant_pollutant: str | None
+    sub_indices: dict[str, int]     # station average when measured, model when estimated
+    stations: int | None            # stations behind a measured value
+    min_aqi: int | None             # range across those stations
+    max_aqi: int | None
+    measured_aqi: int | None
+    model_aqi: int | None
+    model_gap: int | None           # model - measured: positive = model too high
     weather: Weather | None
+
+
+class Station(BaseModel):
+    id: int
+    name: str
+    city: str
+    state: str
+    lat: float
+    lon: float
+    observed_at: str | None
+    aqi: int | None                 # None = too few pollutants for a valid AQI (CPCB rule)
+    category: str | None
+    dominant_pollutant: str | None
+    sub_indices: dict[str, int]
 
 
 class AqiPoint(BaseModel):
     t: str
     aqi: int
     category: str
-    dominant_pollutant: str
+    dominant_pollutant: str | None
+
+
+class MeasuredPoint(BaseModel):
+    t: str
+    aqi: int
+    min_aqi: int
+    max_aqi: int
+    stations: int
 
 
 class ValuePoint(BaseModel):
@@ -95,7 +133,8 @@ class ValuePoint(BaseModel):
 class CityHistory(BaseModel):
     location: str
     hours: int
-    aqi: list[AqiPoint]
+    aqi: list[AqiPoint]                 # model, hourly
+    measured: list[MeasuredPoint]       # CPCB stations, whenever they reported
     pollutants: dict[str, list[ValuePoint]]
     units: dict[str, str]
 
@@ -126,6 +165,7 @@ class Timeline(BaseModel):
 class Overview(BaseModel):
     observed_at: str | None
     cities: int
+    measured: int                   # how many cities have a measured (station) value
     average_aqi: float | None
     counts_by_category: dict[str, int]
     worst: CityNow | None
@@ -147,49 +187,83 @@ class WindGrid(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Queries
+# Helpers
 # ---------------------------------------------------------------------------
 
-LATEST_AQI_SQL = """
-SELECT a.* FROM aqi a
-JOIN (SELECT location, MAX(observed_at) AS latest FROM aqi WHERE source = ? GROUP BY location) l
-  ON a.location = l.location AND a.observed_at = l.latest
-WHERE a.source = ?
+def _iso(ts: datetime | None) -> str | None:
+    return ts.isoformat() if ts is not None else None
+
+
+def _int(x) -> int | None:
+    return None if x is None else int(round(float(x)))
+
+
+def _sub_indices(row: dict) -> dict[str, int]:
+    """{pm25_si: 312, o3_si: None, ...} -> {"PM2.5": 312}"""
+    return {NAMES[code]: _int(row[f"{code}_si"]) for code in NAMES if row.get(f"{code}_si") is not None}
+
+
+def _dominant(subs: dict[str, int]) -> str | None:
+    return max(subs, key=subs.get) if subs else None
+
+
+def _city_id(conn: psycopg.Connection, location: str) -> int:
+    row = conn.execute("SELECT location_id FROM silver.location WHERE kind = 'city' AND name = %s",
+                       (location,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No data for city {location!r}")
+    return row["location_id"]
+
+
+MODEL_SUBS_SQL = f"""
+SELECT DISTINCT ON (location_id) location_id, observed_at, {', '.join(SI_COLS)}
+FROM gold.aqi_hourly WHERE source = 'open-meteo'
+ORDER BY location_id, observed_at DESC
+"""
+
+# Average sub-index per pollutant over a city's stations, for the recent hours.
+MEASURED_SUBS_SQL = f"""
+SELECT cs.city_id AS location_id, a.observed_at,
+       {', '.join(f'avg(a.{c}) AS {c}' for c in SI_COLS)}
+FROM gold.city_station cs
+JOIN gold.aqi_hourly a ON a.location_id = cs.station_id AND a.source = 'cpcb'
+WHERE a.observed_at >= now() - interval '3 hours'
+GROUP BY cs.city_id, a.observed_at
 """
 
 LATEST_WEATHER_SQL = """
-SELECT w.* FROM weather w
-JOIN (SELECT location, MAX(observed_at) AS latest FROM weather GROUP BY location) l
-  ON w.location = l.location AND w.observed_at = l.latest
+SELECT DISTINCT ON (location_id) location_id, temperature_c, humidity_pct, wind_speed_kmh, wind_dir_deg
+FROM silver.weather ORDER BY location_id, observed_at DESC
 """
 
 
-def _since(hours: int) -> str:
-    return (pd.Timestamp.now(tz=TIMEZONE) - pd.Timedelta(hours=hours)).isoformat()
+def _latest_cities(conn: psycopg.Connection) -> list[CityNow]:
+    best = conn.execute("SELECT * FROM gold.city_best WHERE aqi IS NOT NULL").fetchall()
+    model_subs = {r["location_id"]: r for r in conn.execute(MODEL_SUBS_SQL)}
+    measured_subs = {(r["location_id"], r["observed_at"]): r for r in conn.execute(MEASURED_SUBS_SQL)}
+    weather = {r["location_id"]: r for r in conn.execute(LATEST_WEATHER_SQL)}
 
-
-def _latest_cities(conn: sqlite3.Connection, source: str) -> list[CityNow]:
-    aqi = db.read_sql(conn, LATEST_AQI_SQL, (source, source))
-    weather = db.read_sql(conn, LATEST_WEATHER_SQL).set_index("location")
     cities = []
-    for row in aqi.itertuples(index=False):
-        w = weather.loc[row.location] if row.location in weather.index else None
+    for b in best:
+        loc = b["location_id"]
+        if b["basis"] == "measured":
+            subs_row = measured_subs.get((loc, b["observed_at"]), {})
+        else:
+            subs_row = model_subs.get(loc, {})
+        subs = _sub_indices(subs_row) if subs_row else {}
+        w = weather.get(loc)
         cities.append(CityNow(
-            location=row.location, state=row.state, lat=row.lat, lon=row.lon,
-            observed_at=row.observed_at, aqi=row.aqi, category=row.category,
-            dominant_pollutant=row.dominant_pollutant, sub_indices=json.loads(row.sub_indices),
+            location=b["name"], state=b["state"], lat=b["lat"], lon=b["lon"],
+            observed_at=_iso(b["observed_at"]), aqi=b["aqi"], category=b["category"], basis=b["basis"],
+            dominant_pollutant=_dominant(subs), sub_indices=subs,
+            stations=b["stations"], min_aqi=_int(b["min_aqi"]), max_aqi=_int(b["max_aqi"]),
+            measured_aqi=b["measured_aqi"], model_aqi=b["model_aqi"], model_gap=b["model_gap"],
             weather=None if w is None else Weather(
-                temperature_c=w.temperature_c, humidity_pct=w.humidity_pct,
-                wind_speed_kmh=w.wind_speed_kmh, wind_dir_deg=w.wind_dir_deg,
+                temperature_c=w["temperature_c"], humidity_pct=w["humidity_pct"],
+                wind_speed_kmh=w["wind_speed_kmh"], wind_dir_deg=w["wind_dir_deg"],
             ),
         ))
     return sorted(cities, key=lambda c: c.aqi, reverse=True)
-
-
-def _require_location(conn: sqlite3.Connection, location: str, source: str) -> None:
-    found = conn.execute("SELECT 1 FROM aqi WHERE location = ? AND source = ? LIMIT 1", (location, source)).fetchone()
-    if not found:
-        raise HTTPException(status_code=404, detail=f"No data for location {location!r} from source {source!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -198,26 +272,36 @@ def _require_location(conn: sqlite3.Connection, location: str, source: str) -> N
 
 @app.get("/api/health")
 def health(conn: Conn) -> dict:
-    latest = conn.execute("SELECT MAX(observed_at) FROM aqi").fetchone()[0]
-    return {"status": "ok", "latest_aqi_at": latest}
+    """Freshness, not just "the process is up" (Q38): the newest AQI hour, and each source's last fetch."""
+    latest = conn.execute("SELECT max(observed_at) AS t FROM gold.aqi_hourly").fetchone()["t"]
+    runs = conn.execute(
+        "SELECT DISTINCT ON (source) source, status, started_at, records FROM bronze.ingest_run"
+        " ORDER BY source, run_id DESC").fetchall()
+    return {
+        "status": "ok",
+        "latest_aqi_at": _iso(latest),
+        "sources": {r["source"]: {"status": r["status"], "at": _iso(r["started_at"]), "records": r["records"]}
+                    for r in runs},
+    }
 
 
 @app.get("/api/cities", response_model=list[CityNow])
-def cities(conn: Conn, source: Source = DEFAULT_SOURCE) -> list[CityNow]:
-    """Latest AQI + weather for every location, worst first."""
-    return _latest_cities(conn, source)
+def cities(conn: Conn) -> list[CityNow]:
+    """Latest AQI + weather per city, worst first: measured where stations exist, else estimated."""
+    return _latest_cities(conn)
 
 
 @app.get("/api/overview", response_model=Overview)
-def overview(conn: Conn, source: Source = DEFAULT_SOURCE) -> Overview:
+def overview(conn: Conn) -> Overview:
     """National snapshot: how many cities are in each category, worst and best."""
-    now = _latest_cities(conn, source)
+    now = _latest_cities(conn)
     counts: dict[str, int] = {}
     for c in now:
         counts[c.category] = counts.get(c.category, 0) + 1
     return Overview(
         observed_at=max((c.observed_at for c in now), default=None),
         cities=len(now),
+        measured=sum(c.basis == "measured" for c in now),
         average_aqi=round(sum(c.aqi for c in now) / len(now), 1) if now else None,
         counts_by_category=counts,
         worst=now[0] if now else None,
@@ -225,38 +309,81 @@ def overview(conn: Conn, source: Source = DEFAULT_SOURCE) -> Overview:
     )
 
 
+STATIONS_SQL = """
+WITH latest AS (            -- each station's most recent value per pollutant (last 24 h)
+    SELECT DISTINCT ON (location_id, pollutant) location_id, pollutant, value, observed_at
+    FROM silver.air_quality
+    WHERE source = 'cpcb' AND measure = 'sub_index' AND flag = 'ok' AND value IS NOT NULL
+      AND observed_at >= now() - interval '24 hours'
+    ORDER BY location_id, pollutant, observed_at DESC
+)
+SELECT l.location_id AS id, l.name, l.city, l.state, l.lat, l.lon,
+       max(latest.observed_at) AS observed_at,
+       jsonb_object_agg(latest.pollutant, round(latest.value)) AS subs,
+       g.aqi, g.category, g.dominant
+FROM silver.location l
+JOIN latest USING (location_id)
+LEFT JOIN LATERAL (         -- its newest valid AQI from gold, if it has one
+    SELECT aqi, category, dominant FROM gold.aqi_hourly
+    WHERE source = 'cpcb' AND location_id = l.location_id AND observed_at >= now() - interval '24 hours'
+    ORDER BY observed_at DESC LIMIT 1
+) g ON true
+WHERE l.kind = 'station'
+GROUP BY l.location_id, g.aqi, g.category, g.dominant
+"""
+
+
+@app.get("/api/stations", response_model=list[Station])
+def stations(conn: Conn) -> list[Station]:
+    """Every CPCB station that reported in the last 24 h, with its sub-indices and AQI."""
+    out = []
+    for r in conn.execute(STATIONS_SQL):
+        subs = {NAMES.get(code, code): _int(v) for code, v in r["subs"].items()}
+        out.append(Station(
+            id=r["id"], name=r["name"], city=r["city"], state=r["state"], lat=r["lat"], lon=r["lon"],
+            observed_at=_iso(r["observed_at"]), aqi=r["aqi"], category=r["category"],
+            dominant_pollutant=NAMES.get(r["dominant"]) if r["dominant"] else None, sub_indices=subs,
+        ))
+    return out
+
+
 @app.get("/api/cities/{location}/history", response_model=CityHistory)
 def city_history(
     location: str,
     conn: Conn,
     hours: Annotated[int, Query(ge=1, le=24 * 30)] = 72,
-    source: Source = DEFAULT_SOURCE,
 ) -> CityHistory:
-    """Hourly AQI and hourly pollutant concentrations (clean readings only)."""
-    _require_location(conn, location, source)
-    since = _since(hours)
-    aqi = db.read_sql(
-        conn,
-        "SELECT observed_at, aqi, category, dominant_pollutant FROM aqi "
-        "WHERE location = ? AND source = ? AND observed_at >= ? ORDER BY observed_at",
-        (location, source, since),
-    )
-    readings = db.read_sql(
-        conn,
-        "SELECT observed_at, pollutant, value, unit FROM air_quality "
-        "WHERE location = ? AND source = ? AND observed_at >= ? AND flag = 'ok' ORDER BY observed_at",
-        (location, source, since),
-    )
+    """Hourly model AQI, measured AQI whenever stations reported, and model concentrations (clean only)."""
+    loc = _city_id(conn, location)
+    window = {"loc": loc, "hours": hours}
+    since = "observed_at >= now() - make_interval(hours => %(hours)s)"
+    aqi = conn.execute(
+        f"SELECT observed_at, aqi, category, dominant FROM gold.aqi_hourly"
+        f" WHERE source = 'open-meteo' AND location_id = %(loc)s AND {since} ORDER BY observed_at", window)
+    measured = conn.execute(
+        f"SELECT observed_at, aqi, min_aqi, max_aqi, stations FROM gold.city_measured_hourly"
+        f" WHERE location_id = %(loc)s AND {since} ORDER BY observed_at", window)
+    readings = conn.execute(
+        f"SELECT a.observed_at, a.pollutant, a.value, p.unit FROM silver.air_quality a"
+        f" JOIN silver.pollutant p ON p.code = a.pollutant"
+        f" WHERE a.source = 'open-meteo' AND a.measure = 'concentration' AND a.flag = 'ok'"
+        f" AND a.location_id = %(loc)s AND a.{since} ORDER BY a.observed_at", window).fetchall()
+
+    pollutants: dict[str, list[ValuePoint]] = {}
+    units: dict[str, str] = {}
+    for r in readings:
+        name = NAMES[r["pollutant"]]
+        pollutants.setdefault(name, []).append(ValuePoint(t=_iso(r["observed_at"]), value=round(r["value"], 3)))
+        units[name] = r["unit"]
     return CityHistory(
         location=location,
         hours=hours,
-        aqi=[AqiPoint(t=r.observed_at, aqi=r.aqi, category=r.category, dominant_pollutant=r.dominant_pollutant)
-             for r in aqi.itertuples(index=False)],
-        pollutants={
-            p: [ValuePoint(t=r.observed_at, value=round(r.value, 3)) for r in g.itertuples(index=False)]
-            for p, g in readings.groupby("pollutant")
-        },
-        units=readings.groupby("pollutant")["unit"].first().to_dict(),
+        aqi=[AqiPoint(t=_iso(r["observed_at"]), aqi=r["aqi"], category=r["category"],
+                      dominant_pollutant=NAMES.get(r["dominant"]) if r["dominant"] else None) for r in aqi],
+        measured=[MeasuredPoint(t=_iso(r["observed_at"]), aqi=r["aqi"], min_aqi=r["min_aqi"],
+                                max_aqi=r["max_aqi"], stations=r["stations"]) for r in measured],
+        pollutants=pollutants,
+        units=units,
     )
 
 
@@ -265,39 +392,53 @@ def city_daily(
     location: str,
     conn: Conn,
     days: Annotated[int, Query(ge=1, le=366)] = 14,
-    source: Source = DEFAULT_SOURCE,
 ) -> list[DailyRow]:
-    """Daily summaries, oldest first."""
-    _require_location(conn, location, source)
-    rows = db.read_sql(
-        conn,
-        "SELECT * FROM daily_summary WHERE location = ? AND source = ? ORDER BY date DESC LIMIT ?",
-        (location, source, days),
-    )
-    rows = rows.astype(object).where(rows.notna(), None)  # NaN -> None (JSON null)
-    return [DailyRow(**r) for r in rows.iloc[::-1].to_dict("records")]
+    """Daily summaries of the model AQI (complete hourly coverage), oldest first."""
+    loc = _city_id(conn, location)
+    rows = conn.execute(
+        "SELECT day, mean_aqi, min_aqi, max_aqi, hours_covered, worst_category, pct_ok"
+        " FROM gold.daily_summary WHERE source = 'open-meteo' AND location_id = %s"
+        " ORDER BY day DESC LIMIT %s", (loc, days)).fetchall()
+    return [DailyRow(
+        date=r["day"].isoformat(),
+        aqi_mean=None if r["mean_aqi"] is None else round(r["mean_aqi"], 1),
+        aqi_min=r["min_aqi"], aqi_max=r["max_aqi"], aqi_hours=r["hours_covered"],
+        worst_category=r["worst_category"], dominant_pollutant=None,
+        pct_ok=None if r["pct_ok"] is None else round(r["pct_ok"], 1),
+    ) for r in reversed(rows)]
 
 
 @app.get("/api/timeline", response_model=Timeline)
 def timeline(
     conn: Conn,
     hours: Annotated[int, Query(ge=1, le=24 * 7)] = 72,
-    source: Source = DEFAULT_SOURCE,
 ) -> Timeline:
-    """Hourly AQI of every location on ONE shared time axis, for map playback.
+    """Hourly AQI of every city on ONE shared time axis, for map playback.
 
-    Shaped as parallel arrays (times[i] <-> aqi[i]) rather than a list of objects:
+    Same rule as the live view: the measured value for an hour when stations
+    reported, otherwise the model's. Shaped as parallel arrays (times[i] <-> aqi[i]):
     ~15 cities x 72 hours stays a few KB, and the frontend indexes by hour directly.
     """
-    df = db.read_sql(
-        conn,
-        "SELECT location, lat, lon, observed_at, aqi FROM aqi WHERE source = ? AND observed_at >= ?",
-        (source, _since(hours)),
-    )
-    if df.empty:
+    window = {"hours": hours}
+    rows = conn.execute(
+        """
+        SELECT l.name AS location, l.lat, l.lon, a.observed_at, a.aqi, 1 AS priority
+        FROM gold.aqi_hourly a JOIN silver.location l USING (location_id)
+        WHERE a.source = 'open-meteo' AND l.kind = 'city'
+          AND a.observed_at >= now() - make_interval(hours => %(hours)s)
+        UNION ALL
+        SELECT l.name, l.lat, l.lon, m.observed_at, m.aqi, 0
+        FROM gold.city_measured_hourly m JOIN silver.location l USING (location_id)
+        WHERE m.observed_at >= now() - make_interval(hours => %(hours)s)
+        """, window).fetchall()
+    if not rows:
         return Timeline(times=[], cities=[])
-    times = sorted(df["observed_at"].unique())
-    wide = df.pivot_table(index="location", columns="observed_at", values="aqi").reindex(columns=times)
+    df = pd.DataFrame(rows)
+    df["t"] = df["observed_at"].map(_iso)
+    # measured (priority 0) wins over model (priority 1) for the same city and hour
+    df = df.sort_values("priority").drop_duplicates(["location", "t"], keep="first")
+    times = sorted(df["t"].unique())
+    wide = df.pivot_table(index="location", columns="t", values="aqi").reindex(columns=times)
     coords = df.groupby("location")[["lat", "lon"]].first()
     return Timeline(
         times=times,

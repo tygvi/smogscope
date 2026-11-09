@@ -7,12 +7,15 @@ import AnimatedNumber from './AnimatedNumber'
 interface Props {
   overview: Overview | null
   cities: CityNow[]
+  stationCount: number
   selected: string | null
   onSelect: (location: string) => void
   showWind: boolean
   showGlow: boolean
+  showStations: boolean
   onToggleWind: () => void
   onToggleGlow: () => void
+  onToggleStations: () => void
 }
 
 export default function Sidebar(p: Props) {
@@ -42,6 +45,10 @@ export default function Sidebar(p: Props) {
               ) : null
             })}
           </div>
+          <p className="coverage small">
+            <span className="basis-dot measured" /> {p.overview.measured} of {total} measured
+            {p.stationCount > 0 && <> · {p.stationCount} stations live</>}
+          </p>
         </section>
       )}
 
@@ -53,7 +60,15 @@ export default function Sidebar(p: Props) {
               onClick={() => p.onSelect(c.location)}
             >
               <span className="rank">{i + 1}</span>
-              <span className="city-name">{c.location}<small>{POLLUTANT_LABELS[c.dominant_pollutant] ?? c.dominant_pollutant}</small></span>
+              <span className="city-name">
+                {c.location}
+                <small>
+                  <span className={`basis-dot ${c.basis}`}
+                    title={c.basis === 'measured' ? `Measured: ${c.stations} CPCB stations` : 'Estimated by the Open-Meteo model'} />
+                  {c.basis === 'measured' ? `${c.stations} stations` : 'model estimate'}
+                  {c.dominant_pollutant && <> · {POLLUTANT_LABELS[c.dominant_pollutant] ?? c.dominant_pollutant}</>}
+                </small>
+              </span>
               <span className="city-aqi" style={{ background: colorOf(c.aqi) }}>{c.aqi}</span>
             </button>
           </motion.li>
@@ -61,13 +76,14 @@ export default function Sidebar(p: Props) {
       </ol>
 
       <div className="toggles">
-        <label><input type="checkbox" checked={p.showWind} onChange={p.onToggleWind} /> Wind flow</label>
-        <label><input type="checkbox" checked={p.showGlow} onChange={p.onToggleGlow} /> Smog glow</label>
+        <label><input type="checkbox" checked={p.showStations} onChange={p.onToggleStations} /> Stations</label>
+        <label><input type="checkbox" checked={p.showWind} onChange={p.onToggleWind} /> Wind</label>
+        <label><input type="checkbox" checked={p.showGlow} onChange={p.onToggleGlow} /> Glow</label>
       </div>
 
       <footer className="muted tiny">
-        Modeled data (Open-Meteo / Copernicus CAMS); AQI computed with the CPCB method.
-        Ozone estimates over India run high. CPCB station data is planned.
+        City values come from CPCB ground stations within 25 km when one reported in the last 2 h;
+        otherwise from the Open-Meteo / CAMS model (estimated). AQI by the CPCB method.
       </footer>
     </aside>
   )

@@ -8,6 +8,9 @@ export interface Weather {
   wind_dir_deg: number | null
 }
 
+/** "measured" = CPCB ground stations within 25 km; "estimated" = Open-Meteo model. */
+export type Basis = 'measured' | 'estimated'
+
 export interface CityNow {
   location: string
   state: string | null
@@ -16,18 +19,41 @@ export interface CityNow {
   observed_at: string
   aqi: number
   category: string
-  dominant_pollutant: string
+  basis: Basis
+  dominant_pollutant: string | null
   sub_indices: Record<string, number>
+  stations: number | null
+  min_aqi: number | null
+  max_aqi: number | null
+  measured_aqi: number | null
+  model_aqi: number | null
+  model_gap: number | null      // model - measured; positive = the model reads too high
   weather: Weather | null
 }
 
-export interface AqiPoint { t: string; aqi: number; category: string; dominant_pollutant: string }
+export interface Station {
+  id: number
+  name: string
+  city: string
+  state: string
+  lat: number
+  lon: number
+  observed_at: string | null
+  aqi: number | null            // null = too few pollutants for a valid AQI
+  category: string | null
+  dominant_pollutant: string | null
+  sub_indices: Record<string, number>
+}
+
+export interface AqiPoint { t: string; aqi: number; category: string; dominant_pollutant: string | null }
+export interface MeasuredPoint { t: string; aqi: number; min_aqi: number; max_aqi: number; stations: number }
 export interface ValuePoint { t: string; value: number }
 
 export interface CityHistory {
   location: string
   hours: number
   aqi: AqiPoint[]
+  measured: MeasuredPoint[]
   pollutants: Record<string, ValuePoint[]>
   units: Record<string, string>
 }
@@ -51,6 +77,7 @@ export interface Timeline {
 export interface Overview {
   observed_at: string | null
   cities: number
+  measured: number
   average_aqi: number | null
   counts_by_category: Record<string, number>
 }
@@ -73,6 +100,7 @@ const enc = encodeURIComponent
 
 export const api = {
   cities: (s?: AbortSignal) => getJSON<CityNow[]>('/api/cities', s),
+  stations: (s?: AbortSignal) => getJSON<Station[]>('/api/stations', s),
   overview: (s?: AbortSignal) => getJSON<Overview>('/api/overview', s),
   timeline: (s?: AbortSignal) => getJSON<Timeline>('/api/timeline?hours=72', s),
   wind: (s?: AbortSignal) => getJSON<WindGrid>('/api/wind', s),

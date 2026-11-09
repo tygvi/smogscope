@@ -777,7 +777,7 @@ than no test. Wait for conditions, not for fixed amounts of time.
 
 | Layer | Tool | What's covered |
 |---|---|---|
-| API | pytest + FastAPI `TestClient` | Every endpoint against a **temporary database**: latest-row logic, flagged data hidden, 404s, 422 validation, wind cache, stale-on-error, 503 |
+| API | pytest + FastAPI `TestClient` | Every endpoint against a **throwaway PostgreSQL database built from the real migrations** (`smogscope_test`): measured beats model, station listing, flagged data hidden, measured hours in playback, 404s, 422 validation, wind cache, stale-on-error, 503 |
 | Wind math | Vitest | Bilinear interpolation: exact at grid points, linear in between, null outside |
 | Whole app | Puppeteer (manual check) | Markers render, the wind canvas draws, the panel opens with charts, no console errors, desktop and phone |
 
@@ -877,6 +877,126 @@ waits more than one minute of awake time before re-checking the real clock and n
 - A laptop is a poor server: sleep, lid closing and Wi-Fi changes all interrupt it. Deployment (Phase 7) moves the
   scheduler to an always-on machine.
 
+# Government data and the PostgreSQL warehouse
+
+## Q39. Why did CPCB look "down" for a whole day, and how was the real cause found?
+
+For about 18 hours every request from our pipeline to data.gov.in hung for 60 seconds and returned **HTTP 502 Bad Gateway**.
+It looked exactly like a server outage. It wasn't one. The diagnosis changed **one variable at a time**:
+
+| Test | Result | What it ruled out |
+|---|---|---|
+| `curl` with `limit=1`, 3, 5 | ✅ 200 in 0.4 s | "The server is down" |
+| `curl` with `limit` = 10, 50 … 1000 | ✅ all 200, fast | "Big pages time out" (our first theory, **wrong**) |
+| `curl` pretending to be Python (`-A "python-requests/2.32.3"`) | ❌ **502 after 61 s** | It's the **User-Agent** |
+| `curl -A "SmogScope/0.1 (+github link)"` | ✅ 200 in 0.5 s | An honest custom name is fine |
+
+**Failure mode 1: a bot filter.** data.gov.in's firewall silently stalls any request whose `User-Agent` header is the
+default `python-requests/x.y`, then answers with a fake 502. **Fix:** the fetcher's session sends
+`User-Agent: SmogScope/0.1 (+https://github.com/tygvi/smogscope)`. Identifying honestly beats impersonating a browser.
+
+**Failure mode 2: throttling disguised as success.** After ~40 requests in 15 minutes of debugging, the API began answering
+**HTTP 200, status "ok", total 0, message "No query was recieved."**, for curl too. A fake key got a *different* answer, and the
+website's own table still had data, so the gateway was fine and only *our key* was being cut off. It recovered by itself
+within ~7 minutes. **Fix:** the fetcher now treats "first page empty" as a **failure** (`CPCBResponseError`), because CPCB
+always has ~4,000 records. Before this fix, run 2 was stored as `ok` with 0 records, a silent lie in the audit log.
+
+**Failure mode 3: real hiccups.** Genuine 502/503s still happen, so the retry-with-backoff session stays.
+
+**Two security fixes found on the way:**
+
+- The API key is part of the request URL, so it appeared in every error message: the terminal, the scheduler log, and the
+  `error` column of `bronze.ingest_run`. Errors are now passed through `_redact()` (key → `***`) and re-raised `from None`,
+  which drops the original exception that carried the full URL. The already-stored error was cleaned with `regexp_replace`.
+- `ingest_run` caught `Exception`, but **Ctrl+C raises `KeyboardInterrupt`, which inherits from `BaseException`**, so an
+  interrupted run stayed `running` forever. It now catches `BaseException` (and re-raises).
+
+**Lessons:** when one client works and another fails on the same URL, **compare the requests, not the servers**. Don't trust
+"200 OK": check that the body contains what you asked for. And a "measurement" you didn't check the body of (our first
+SmogScope curl test used `-o /dev/null`) isn't a measurement.
+
+## Q40. How do we know CPCB publishes sub-indices, not concentrations?
+
+The dataset's documentation calls the field `avg_value` and gives no unit. Four clues from the first 3,658 values, each
+checkable with one SQL query on the **bronze** layer:
+
+| Clue | If they were concentrations | If they are sub-indices |
+|---|---|---|
+| CO mean 43.9, max 161 | ❌ 161 mg/m³ of CO is life-threatening; city air is 0.5–3 | ✅ 44 ≈ 0.9 mg/m³; 161 ≈ 7 mg/m³ near traffic |
+| NH₃ mean 6.2 | Unusually low for Indian cities | ✅ NH₃'s sub-index ≈ concentration ÷ 4, so ≈ 25 µg/m³: typical |
+| PM2.5 max 433, PM10 max 449: never above 500 | Real smog exceeds 500 µg/m³ | ✅ the AQI scale stops at 500 |
+| **0 of 3,658 values have decimals** | Instruments report decimals | ✅ sub-indices are rounded integers |
+
+**Consequence:** the old CPCB code ran these numbers through the AQI formula **a second time**, which would have produced
+nonsense. It never ran successfully (Q39), so nothing wrong was stored. In silver, CPCB values carry
+`measure = 'sub_index'` and Open-Meteo's carry `'concentration'`; `measure` is part of the primary key, so the two can never be
+mixed. A station's AQI is simply its **maximum** sub-index.
+
+**Why this matters for the design:** the misreading was caught *because* bronze kept the raw values. We inspected them
+**before** writing any cleaned data. That is the whole argument for a raw layer.
+
+## Q41. Why PostgreSQL with bronze, silver and gold layers?
+
+**Why leave SQLite?** ~560 stations × 7 pollutants every 30 minutes is far more data than 15 cities; we need real types
+(`timestamptz`, `jsonb`, enums), constraints the database enforces (`CHECK`, `REFERENCES`), concurrent readers and writers,
+and SQL features like `DISTINCT ON`, `FILTER`, lateral joins and views. It's also what Phase 7 deploys.
+
+**The medallion pattern:**
+
+| Layer | Holds | Rule | Why |
+|---|---|---|---|
+| 🥉 **bronze** | Exactly what each API sent, as `jsonb`, plus `ingest_run` (one row per fetch: status, record count, error) | Insert-only; never edited | **Replayable** (fix a transform bug, re-run it) and **auditable** (Q39's whole story is in `ingest_run`). `jsonb` accepts schema changes from the source without breaking. |
+| 🥈 **silver** | Typed, cleaned, de-duplicated readings; `location` (cities + stations); `pollutant` reference | One row per (source, place, pollutant, measure, hour); upserts | One trusted shape for both sources; duplicates are impossible by primary key |
+| 🥇 **gold** | Hourly AQI, daily summaries, and **views** that merge sources | Recomputed from silver over a recent window | What the website and ML read |
+
+**Decisions inside the layers:**
+
+- **Migrations as numbered files** (`sql/001_schema.sql`, `002_silver_measure.sql`, `003_gold_views.sql`). An applied migration is
+  never edited, just like a commit. A new database runs them in order; the API tests do exactly that.
+- **Incremental and idempotent.** Silver transforms only bronze runs whose `silver_done_at` is empty, oldest first so the newest
+  data wins, one transaction per run. Running anything twice gives the same result. Proof from the first run: two CPCB runs
+  with ~7,850 raw records for the same hour became **3,884** silver rows.
+- **Lineage:** every silver row keeps its `run_id`, so any number on the website can be traced to the exact JSON it came from.
+- **NaN is not NULL.** psycopg stores Python's `float('nan')` as PostgreSQL `'NaN'`, which `IS NULL` doesn't match, so every
+  write goes through `_rows()`, which converts NaN to `None`.
+- **Quality flags run over a 72-hour window**, not just new rows: "stuck for 6 hours" can't be seen one row at a time. The
+  PostgreSQL port reproduced the SQLite pipeline's verdict exactly (Chennai O₃ stuck at 36.0), which validated the port.
+- **Calculations in Python, merge rules in SQL views.** `gold.py` reuses the tested `hourly_aqi()` for the model, and computes
+  station AQI in one SQL statement (`max`, `FILTER`, `array_agg … ORDER BY` for the dominant pollutant, and the CPCB validity
+  rule in `HAVING`). The merge rules live in views, so changing "2 hours" is a one-line change with nothing to recompute.
+- **Weather became hourly history**: the SQLite pipeline only kept a "current" snapshot, so hours missed while the laptop slept
+  were lost. Bronze now stores 2 past days hourly, and overlapping fetches backfill gaps.
+- **SQL injection:** table names can't be `%s` parameters, so they come from a fixed dictionary (`OPEN_METEO_TABLES`), never from input.
+
+## Q42. How are measured and modeled data merged, and how wrong is the model?
+
+**Never mixed in storage; merged only in one gold view.** `gold.city_best`:
+
+1. **Stations belong to a city by distance** (≤ 25 km, haversine formula in `gold.distance_km`), not by name: CPCB's city names
+   are inconsistent ("Delhi" vs "New Delhi", suburbs).
+2. **A city's measured AQI** = the average of its stations' AQIs (as CPCB's bulletin does), plus min, max and station count.
+3. **Shown value:** *measured* if any station reported in the last 2 hours, else the model's *estimate*. Every city says which (`basis`).
+4. **`model_gap` = model − measured**, kept for every city: the training target for Phase 5's bias correction.
+
+**First comparison (7 Nov, 10:00, all 15 cities measured):**
+
+| | |
+|---|---|
+| Mean absolute error of the model | **≈ 75 AQI points** |
+| Same category as the stations | **6 of 15** cities |
+| Worst overestimate | **Mumbai +208** (model "Very Poor", stations "Moderate"): the ozone bias suspected earlier, now confirmed |
+| Worst underestimate | **Delhi −124** (model "Poor", stations "Very Poor"): the model misses local sources |
+| Spread inside one city | Delhi's 68 stations: **226 to 449** |
+
+One snapshot isn't proof, but the direction is clear: the site must lead with measured data, and the model's error is
+large and **systematic**, which is what makes it learnable.
+
+**On the map:** every station is a dot in its AQI color (grey: too few pollutants for a valid AQI; faded: silent for 3 h),
+drawn as one GPU circle layer, not 560 HTML markers that would stutter while panning. City rings are **solid when measured,
+dashed when estimated**. Station popups are built with `textContent`, never `innerHTML`, because station names are outside
+data. The city panel compares stations vs. model and charts the model as a line with station readings as dots. Playback uses
+the measured value for any hour where stations reported.
+
 # Code reference: every function
 
 ## `aqi_india/config.py`
@@ -908,11 +1028,13 @@ waits more than one minute of awake time before re-checking the real clock and n
 
 ## `aqi_india/fetchers/cpcb.py`
 
-- **`_session()`**: an HTTP session that retries 429/5xx responses with exponential backoff.
-- **`_fetch_all_records(api_key, page_size, max_pages)`**: paginates with `limit`/`offset` until `total` records are fetched.
-- **`fetch_cpcb(api_key)`**: parses records into the same long format as Open-Meteo; handles old and new field
-  names, `"NA"` values, and `dd-mm-yyyy` timestamps.
-- **`CPCBResponseError`**: raised when the server returns something other than JSON (Q17).
+- **`USER_AGENT`**: `SmogScope/0.1 (+github link)`; the default `python-requests` one is blocked with a fake 502 (Q39).
+- **`_session()`**: an HTTP session with that User-Agent that retries 429/5xx responses with exponential backoff.
+- **`_redact(text, secret)`**: replaces the API key with `***` in error messages (Q39).
+- **`_fetch_all_records(api_key, page_size, max_pages)`**: paginates with `limit`/`offset` until `total` records are fetched,
+  logging progress per page. An empty first page or any request error raises `CPCBResponseError`, with the key redacted.
+- **`fetch_cpcb(api_key)`**: (legacy SQLite pipeline) parses records into the same long format as Open-Meteo.
+- **`CPCBResponseError`**: data.gov.in failed or answered without usable data; the message never contains the key (Q17, Q39).
 
 ## `aqi_india/db.py`
 
@@ -935,7 +1057,7 @@ waits more than one minute of awake time before re-checking the real clock and n
 - **`assess(df)`**: runs all checks and adds `flag` and `flag_reason` (Q15).
 - **`_all_false(df)`**: helper that returns an all-False result for empty or irrelevant input.
 
-## `aqi_india/pipeline.py`
+## `aqi_india/pipeline.py` (legacy SQLite pipeline, no longer scheduled; replaced by the warehouse, Q41)
 
 - **`run_once()`**: ingest, assess and write flags, hourly AQI from clean data, daily summaries (Q16, Q19–Q21).
 - **`_ingest(conn)`**: fetches and stores every source; skips CPCB on expected failures only (Q17).
@@ -953,28 +1075,74 @@ waits more than one minute of awake time before re-checking the real clock and n
 - **`_local_date(ts)`**: timestamp to India calendar date string.
 - **`LOCATION_COLS`**, **`AQI_COLS`**: the shared column lists for location data and `aqi` table rows.
 
+## `aqi_india/pg.py`: bronze (raw ingestion into PostgreSQL)
+
+- **`PG_DSN`**: where the database is (`SMOGSCOPE_PG_DSN` environment variable, default `dbname=smogscope`).
+- **`connect()`**: a psycopg connection.
+- **`ingest_run(conn, source)`**: context manager that records one fetch in `bronze.ingest_run`: commits a `running` row first,
+  then marks it `ok` with a record count, or rolls back the half-written data and marks it `failed` with the error, even on Ctrl+C (Q39).
+- **`store_cpcb_records(conn, run_id, records)`**: one `jsonb` row per raw CPCB record (`executemany`).
+- **`ingest_cpcb()`**: fetch all CPCB pages and store them raw.
+- **`store_open_meteo(conn, source, run_id, cities, results)`** / **`ingest_open_meteo(source)`**: one request for all 15 cities,
+  2 past days hourly, each city's JSON stored whole. Table names come from `OPEN_METEO_TABLES`, never from input.
+- **`ingest_all()`**: all three sources, each independently, so one failing doesn't stop the others.
+
+## `aqi_india/silver.py`: bronze → clean rows
+
+- **`run_silver()`**: transforms every `ok` bronze run without `silver_done_at`, oldest first, one transaction each; then re-flags (Q41).
+- **`transform_cpcb(conn, run_id)`**: stations into `silver.location`, sub-indices into `silver.air_quality` (`measure='sub_index'`);
+  skips records without coordinates and unknown pollutants (logged), `"NA"` → NULL, 0–500 range check (Q40).
+- **`transform_open_meteo_aq(conn, run_id)`**: unpivots each city's hourly arrays into one row per city × hour × pollutant;
+  CO µg/m³ → mg/m³; future hours dropped.
+- **`transform_open_meteo_weather(conn, run_id)`**: one row per city × hour with all weather columns.
+- **`reflag_concentrations(conn, hours=72)`**: re-runs `quality.assess()` over the recent window and writes the flags.
+- **`upsert_locations(conn, rows)`** / **`city_ids(conn)`**: insert new places, keep existing IDs stable; name → `location_id`.
+- **`upsert_air_quality(conn, df)`**, **`_hourly_frame(payload, now)`**, **`_rows(df, cols)`** (NaN → NULL, numpy → Python).
+- **`CPCB_POLLUTANTS`**, **`OM_POLLUTANTS`**, **`QUALITY_NAMES`**: code mappings between sources, our codes and display names.
+
+## `aqi_india/gold.py`: AQI and summaries
+
+- **`run_gold()`**: model AQI, station AQI and daily tables in one transaction.
+- **`model_aqi(conn, hours=72)`**: clean model concentrations → hourly AQI with the tested `hourly_aqi()`, reading 24 h extra.
+- **`station_aqi(conn, hours=72)`**: `STATION_AQI_SQL`: max sub-index per station and hour, the CPCB validity rule in `HAVING`.
+- **`daily(conn, days=3)`**: `DAILY_SUMMARY_SQL` and `DAILY_POLLUTANT_SQL` by India calendar day (concentrations only for pollutants).
+- **`upsert_aqi(conn, df)`**: writes `gold.aqi_hourly`.
+
+## `aqi_india/warehouse.py`
+
+- **`run_warehouse()`**: `ingest_all()` → `run_silver()` → `run_gold()`; what the scheduler runs.
+
+## `sql/`: migrations
+
+- **`001_schema.sql`**: the three schemas, all bronze/silver/gold tables, the pollutant reference rows, `gold.city_latest`.
+- **`002_silver_measure.sql`**: `silver.air_quality.measure` (in the primary key) and `bronze.ingest_run.silver_done_at`.
+- **`003_gold_views.sql`**: `gold.aqi_category()`, `gold.distance_km()` (haversine), and the views `gold.city_station`,
+  `gold.city_measured_hourly` and `gold.city_best` (Q42).
+
 ## `aqi_india/scheduler.py`
 
-- **`job()`**: one pipeline run, wrapped so a failure is logged and retried at the next interval instead of stopping the scheduler.
+- **`job()`**: one warehouse refresh, wrapped so a failure is logged and retried at the next interval instead of stopping the scheduler.
 - **`main()`**: APScheduler every 30 minutes, starting immediately, never overlapping runs; after sleep or downtime, exactly one catch-up run however late (`coalesce=True`, `misfire_grace_time=None`), plus a 1-minute heartbeat so the catch-up happens promptly after waking (Q38).
 
 ## `aqi_india/api.py`: the HTTP API
 
-- **`app`**: the FastAPI application. Interactive docs at `/docs`.
-- **`get_conn()`**: dependency that gives each request its own database connection and always closes it (Q26).
-- **`health()`**: `GET /api/health`, liveness check plus the newest AQI timestamp.
-- **`cities(source)`**: `GET /api/cities`, latest AQI and weather per location, worst first.
-- **`overview(source)`**: `GET /api/overview`, national average, cities per category, worst and best.
-- **`city_history(location, hours, source)`**: `GET /api/cities/{location}/history`, hourly AQI and clean pollutant readings.
-- **`city_daily(location, days, source)`**: `GET /api/cities/{location}/daily`, daily summaries, oldest first.
-- **`timeline(hours, source)`**: `GET /api/timeline`, every city's hourly AQI on one shared time axis (parallel arrays, Q25).
+- **`app`**: the FastAPI application. Interactive docs at `/docs`. Reads the PostgreSQL gold layer (Q41, Q42).
+- **`get_conn()`**: dependency that gives each request its own autocommit psycopg connection (dict rows, India time zone) and always closes it (Q26).
+- **`health()`**: `GET /api/health`, the newest AQI hour plus each source's last fetch status: freshness, not just liveness (Q38).
+- **`cities()`**: `GET /api/cities`, per city from `gold.city_best`: AQI, `basis` (measured/estimated), station count and range,
+  measured vs. model AQI and the gap, sub-indices (station average or model), latest weather; worst first.
+- **`overview()`**: `GET /api/overview`, national average, cities per category, how many are measured, worst and best.
+- **`stations()`**: `GET /api/stations`, every CPCB station that reported in 24 h, with latest sub-indices and AQI.
+- **`city_history(location, hours)`**: `GET /api/cities/{location}/history`, hourly model AQI, measured points, clean concentrations.
+- **`city_daily(location, days)`**: `GET /api/cities/{location}/daily`, daily summaries of the model AQI, oldest first.
+- **`timeline(hours)`**: `GET /api/timeline`, every city's hourly AQI on one time axis (parallel arrays, Q25), measured hours preferred.
 - **`wind()`**: `GET /api/wind`, the wind grid with a 1-hour cache, a lock, and stale-on-error (Q27).
-- **`_latest_cities(conn, source)`**: the "latest row per city" query joined with the latest weather.
-- **`_require_location(conn, location, source)`**: raises a 404 for unknown locations.
-- **`_since(hours)`**: ISO timestamp *hours* ago, in India time.
+- **`_latest_cities(conn)`**: combines `city_best` with model or station-average sub-indices and the latest weather.
+- **`_city_id(conn, location)`**: city name → `location_id`, or a 404.
+- **`_iso`**, **`_int`**, **`_sub_indices`**, **`_dominant`**: small conversions (timestamps, rounding, `pm25_si` columns → `{"PM2.5": …}`).
 - **`_fetch_wind()`**: thin wrapper so tests can replace the network call.
-- **Response models** (`CityNow`, `Weather`, `CityHistory`, `AqiPoint`, `ValuePoint`, `DailyRow`, `Timeline`,
-  `TimelineCity`, `Overview`, `WindGrid`): the API contract (Q24).
+- **Response models** (`CityNow`, `Station`, `Weather`, `CityHistory`, `AqiPoint`, `MeasuredPoint`, `ValuePoint`, `DailyRow`,
+  `Timeline`, `TimelineCity`, `Overview`, `WindGrid`): the API contract (Q24).
 - If `web/dist` exists, it's mounted at `/` so one process serves the whole app (Q28).
 
 ## `web/src/`: the frontend
@@ -985,12 +1153,15 @@ waits more than one minute of awake time before re-checking the real clock and n
 - **`aqi.ts`**: AQI categories with colors, pulse speeds and health advice; `categoryInfo(aqi)`, `colorOf(aqi)`, pollutant labels with subscripts.
 - **`hooks.ts`**: `usePolling(fetcher, interval)` fetches and refreshes, keeping the last good data and cancelling on unmount;
   `usePrefersReducedMotion()`; `formatTime(iso)` in India time.
-- **`components/MapView.tsx`**: creates the MapLibre map once; hides the basemap's borders and draws India's official boundary with an outside-India mask (`addOfficialBoundary`, `outsideMask`, Q37); keeps one HTML marker per city in sync with live or playback AQI;
-  manages the smog-glow layer; flies to the selected city (Q30, Q31).
+- **`components/MapView.tsx`**: creates the MapLibre map once; hides the basemap's borders and draws India's official boundary with an outside-India mask (`addOfficialBoundary`, `outsideMask`, Q37); keeps one HTML marker per city in sync with live or playback AQI
+  (dashed ring when estimated); manages the smog-glow layer and the **stations** circle layer with click popups
+  (`stationCard`, built with `textContent` via `el()`); flies to the selected city (Q30, Q31, Q42).
 - **`components/WindLayer.tsx`**: the particle system (Q32). `sampleWind(grid, lon, lat)` does the bilinear interpolation, exported for tests.
-- **`components/CityPanel.tsx`**: the city detail panel: animated AQI, advice, sub-index bars, weather, a 72-hour chart
-  with a category-colored gradient (`categoryStops`), and daily bars with low-coverage days faded.
-- **`components/Sidebar.tsx`**: brand, national average, category distribution bar, ranked city list (animated reordering), toggles.
+- **`components/CityPanel.tsx`**: the city detail panel: measured/estimated badge, animated AQI, range across stations,
+  advice, **stations vs. model** bars with the gap, sub-index bars, weather, a 72-hour chart (model line with a
+  category-colored gradient via `categoryStops`, station readings as dots), and daily bars with low-coverage days faded.
+- **`components/Sidebar.tsx`**: brand, national average, category distribution bar, "N of 15 measured · M stations live",
+  ranked city list with measured/estimated badges (animated reordering), toggles for stations, wind and glow.
 - **`components/TimelineBar.tsx`**: play/pause, a time slider, and a *Live* button.
 - **`components/AnimatedNumber.tsx`**: a number that counts smoothly from its previous value to the new one.
 - **`styles.css`**: dark theme tokens, glass panels, marker pulse animation, the phone layout, reduced-motion rules.

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
 import {
-  Area, AreaChart, Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Area, Bar, BarChart, Cell, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
 import { api, type CityHistory, type CityNow, type DailyRow } from '../api'
 import { CATEGORIES, POLLUTANT_LABELS, categoryInfo, colorOf } from '../aqi'
@@ -46,8 +46,17 @@ export default function CityPanel({ city, onClose }: Props) {
     return () => ctrl.abort()
   }, [city.location])
 
-  const chart = useMemo(() => (history?.aqi ?? []).map((p) => ({ t: p.t, aqi: p.aqi })), [history])
-  const maxY = Math.max(100, ...chart.map((p) => p.aqi)) * 1.1
+  // One row per hour: the model's AQI (line) and, where stations reported, the measured AQI (dots).
+  const chart = useMemo(() => {
+    if (!history) return []
+    const rows = new Map<string, { t: string; aqi?: number; measured?: number }>()
+    for (const p of history.aqi) rows.set(p.t, { t: p.t, aqi: p.aqi })
+    for (const m of history.measured) rows.set(m.t, { ...(rows.get(m.t) ?? { t: m.t }), measured: m.aqi })
+    return [...rows.values()].sort((a, b) => a.t.localeCompare(b.t))
+  }, [history])
+  const maxY = Math.max(100, ...chart.map((p) => Math.max(p.aqi ?? 0, p.measured ?? 0))) * 1.1
+  const measured = city.basis === 'measured'
+  const gap = city.model_gap
   const subIndices = Object.entries(city.sub_indices).sort((a, b) => b[1] - a[1])
   const w = city.weather
 
@@ -70,17 +79,55 @@ export default function CityPanel({ city, onClose }: Props) {
         <button className="icon-btn" onClick={onClose} aria-label="Close panel">✕</button>
       </header>
 
+      <p className={`basis-badge ${city.basis}`}>
+        <span className={`basis-dot ${city.basis}`} />
+        {measured ? `Measured · ${city.stations} CPCB station${city.stations === 1 ? '' : 's'}` : 'Estimated · Open-Meteo model'}
+      </p>
+
       <section className="aqi-hero">
         <div className="aqi-big"><AnimatedNumber value={city.aqi} /></div>
         <div>
           <span className="chip">{info.name}</span>
-          <p className="muted small">Dominant: <strong>{POLLUTANT_LABELS[city.dominant_pollutant] ?? city.dominant_pollutant}</strong></p>
+          {city.dominant_pollutant && (
+            <p className="muted small">Dominant: <strong>{POLLUTANT_LABELS[city.dominant_pollutant] ?? city.dominant_pollutant}</strong></p>
+          )}
+          {measured && city.min_aqi != null && city.max_aqi != null && (
+            <p className="muted small">Range across stations: <strong>{city.min_aqi}–{city.max_aqi}</strong></p>
+          )}
         </div>
       </section>
       <p className="advice">{info.advice}</p>
 
+      {city.measured_aqi != null && city.model_aqi != null && (
+        <section>
+          <h3>Stations vs. model</h3>
+          <ul className="bars compare">
+            {[
+              { label: 'Stations', value: city.measured_aqi },
+              { label: 'Model', value: city.model_aqi },
+            ].map((row, i) => (
+              <li key={row.label}>
+                <span className="bar-label">{row.label}</span>
+                <span className="bar-track">
+                  <motion.span className="bar-fill" style={{ background: colorOf(row.value) }}
+                    initial={{ width: 0 }} animate={{ width: `${Math.min(100, (row.value / 500) * 100)}%` }}
+                    transition={{ delay: 0.08 * i, duration: 0.7, ease: [0.16, 1, 0.3, 1] }} />
+                </span>
+                <span className="bar-value">{row.value}</span>
+              </li>
+            ))}
+          </ul>
+          {gap != null && (
+            <p className="muted small">
+              {gap === 0 ? 'The model matches the stations.'
+                : `The model reads ${Math.abs(gap)} ${gap > 0 ? 'higher' : 'lower'} than the stations.`}
+            </p>
+          )}
+        </section>
+      )}
+
       <section>
-        <h3>Pollutant sub-indices</h3>
+        <h3>Pollutant sub-indices <small className="muted">{measured ? '(station average)' : '(model)'}</small></h3>
         <ul className="bars">
           {subIndices.map(([p, si], i) => (
             <li key={p}>
@@ -120,7 +167,7 @@ export default function CityPanel({ city, onClose }: Props) {
         <div className="chart">
           {chart.length === 0 ? <div className="skeleton" /> : (
             <ResponsiveContainer width="100%" height={150}>
-              <AreaChart data={chart} margin={{ top: 6, right: 4, bottom: 0, left: -18 }}>
+              <ComposedChart data={chart} margin={{ top: 6, right: 4, bottom: 0, left: -18 }}>
                 <defs>
                   <linearGradient id="aqiStroke" x1="0" y1="0" x2="0" y2="1">
                     {categoryStops(maxY).map((s, i) => <stop key={i} offset={s.offset} stopColor={s.color} />)}
@@ -135,18 +182,23 @@ export default function CityPanel({ city, onClose }: Props) {
                 <Tooltip
                   contentStyle={{ background: '#121826', border: '1px solid #253047', borderRadius: 8 }}
                   labelFormatter={(t) => formatTime(String(t))}
-                  formatter={(v) => [String(v), 'AQI']}
+                  formatter={(v, name) => [String(v), name === 'measured' ? 'Stations' : 'Model']}
                 />
                 <Area type="monotone" dataKey="aqi" stroke="url(#aqiStroke)" strokeWidth={2.2}
-                  fill="url(#aqiFill)" isAnimationActive animationDuration={900} />
-              </AreaChart>
+                  fill="url(#aqiFill)" isAnimationActive animationDuration={900} connectNulls />
+                {/* dots only (no line): hours without a station report are simply skipped */}
+                <Line dataKey="measured" stroke="none" isAnimationActive={false} legendType="none"
+                  dot={{ r: 3.5, fill: '#ffffff', stroke: '#0a0e16', strokeWidth: 1.5 }}
+                  activeDot={{ r: 5, fill: '#ffffff' }} />
+              </ComposedChart>
             </ResponsiveContainer>
           )}
         </div>
+        <p className="muted small">Line: model, hourly. White dots: CPCB stations, collected every 30 min.</p>
       </section>
 
       <section>
-        <h3>Daily (mean AQI)</h3>
+        <h3>Daily mean AQI <small className="muted">(model)</small></h3>
         <div className="chart">
           {!daily ? <div className="skeleton short" /> : (
             <ResponsiveContainer width="100%" height={110}>

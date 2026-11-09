@@ -18,6 +18,7 @@ export default function App() {
   const cities = usePolling(api.cities, FIVE_MIN)
   const overview = usePolling(api.overview, FIVE_MIN)
   const timeline = usePolling(api.timeline, FIVE_MIN)
+  const stations = usePolling(api.stations, FIVE_MIN)
   const wind = usePolling(api.wind, 30 * 60 * 1000)
 
   const [selected, setSelected] = useState<string | null>(null)
@@ -25,6 +26,7 @@ export default function App() {
   const [playing, setPlaying] = useState(false)
   const [showWind, setShowWind] = useState(!reducedMotion)
   const [showGlow, setShowGlow] = useState(true)
+  const [showStations, setShowStations] = useState(true)
 
   // Playback: advance one hour every 300 ms; stop (and go live) at the end.
   useEffect(() => {
@@ -61,17 +63,22 @@ export default function App() {
         wind={wind.data}
         showWind={showWind}
         showGlow={showGlow}
+        stations={stations.data ?? []}
+        showStations={showStations}
       />
 
       <Sidebar
         overview={overview.data}
         cities={cityList}
+        stationCount={stations.data?.length ?? 0}
         selected={selected}
         onSelect={setSelected}
         showWind={showWind}
         showGlow={showGlow}
+        showStations={showStations}
         onToggleWind={() => setShowWind((v) => !v)}
         onToggleGlow={() => setShowGlow((v) => !v)}
+        onToggleStations={() => setShowStations((v) => !v)}
       />
 
       <Suspense fallback={null}>
@@ -97,6 +104,10 @@ export default function App() {
         {CATEGORIES.map((c) => (
           <span key={c.name}><i style={{ background: c.color }} />{c.name} <small>≤{c.max}</small></span>
         ))}
+        <span className="legend-sep" aria-hidden />
+        <span title="City value from CPCB ground stations"><i className="key-measured" />Measured</span>
+        <span title="No station nearby reported recently: Open-Meteo model estimate"><i className="key-estimated" />Estimated</span>
+        <span title="A CPCB monitoring station"><i className="key-station" />Station</span>
       </div>
 
       {cities.error && !cities.data && (

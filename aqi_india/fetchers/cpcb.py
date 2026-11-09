@@ -39,14 +39,25 @@ POLLUTANT_MAP = {
 
 
 class CPCBResponseError(RuntimeError):
-    """data.gov.in answered, but not with usable JSON (an expected, temporary failure)."""
+    """data.gov.in failed or answered without usable JSON. The message never contains the API key."""
+
+
+# data.gov.in's firewall silently stalls requests whose User-Agent is the default
+# "python-requests/x.y" and answers with a 502 after ~60 s, which looks exactly like an
+# outage. curl's UA and an honest custom one get through in under a second (Q39).
+USER_AGENT = "SmogScope/0.1 (+https://github.com/tygvi/smogscope)"
+
+
+def _redact(text: str, secret: str) -> str:
+    """Hide the API key: it is part of the request URL, so it leaks into error messages."""
+    return text.replace(secret, "***") if secret else text
 
 
 def _session() -> requests.Session:
-    """A session that automatically retries when data.gov.in has a bad moment.
+    """A session that identifies itself honestly and retries when data.gov.in has a bad moment.
 
-    The API often returns 502/503/504 or hangs; retrying with exponential backoff
-    (waits of 2 s, 4 s, ...) usually gets through without us writing a manual loop.
+    Retrying with exponential backoff (waits of 2 s, 4 s, ...) handles real 502/503/504
+    blips without us writing a manual loop.
     """
     retry = Retry(
         total=3,
@@ -55,6 +66,7 @@ def _session() -> requests.Session:
         allowed_methods=("GET",),
     )
     session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
     session.mount("https://", HTTPAdapter(max_retries=retry))
     return session
 
@@ -63,23 +75,33 @@ def _fetch_all_records(api_key: str, page_size: int, max_pages: int) -> list[dic
     records: list[dict] = []
     offset = 0
     session = _session()
-    for _ in range(max_pages):
-        resp = session.get(
-            URL,
-            params={"api-key": api_key, "format": "json", "limit": page_size, "offset": offset},
-            timeout=(10, 90),  # (connect, read) seconds
-        )
-        resp.raise_for_status()
+    for page in range(1, max_pages + 1):
+        try:
+            resp = session.get(
+                URL,
+                params={"api-key": api_key, "format": "json", "limit": page_size, "offset": offset},
+                timeout=(10, 90),  # (connect, read) seconds
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            # `from None` drops the original exception, whose message includes the full URL + key.
+            raise CPCBResponseError(f"CPCB request failed on page {page}: {_redact(str(e), api_key)}") from None
         try:
             payload = resp.json()
-        except ValueError as e:
+        except ValueError:
             raise CPCBResponseError(
                 f"data.gov.in returned non-JSON (HTTP {resp.status_code}): {resp.text[:200]!r}"
-            ) from e
+            ) from None
         batch = payload.get("records", [])
+        total = int(payload.get("total", 0) or 0)
+        if page == 1 and total == 0:
+            # A third failure mode: HTTP 200, status "ok", but empty, with a message like
+            # "No query was recieved." CPCB always has thousands of records, so an empty
+            # first page is a failure, not "no data" (Q39).
+            raise CPCBResponseError(f"data.gov.in returned no records: {payload.get('message')!r}")
         records.extend(batch)
         offset += len(batch)
-        total = int(payload.get("total", 0) or 0)
+        log.info("CPCB: page %d, %d/%d records", page, offset, total)
         if not batch or offset >= total:
             break
     log.info("CPCB: fetched %d records", len(records))

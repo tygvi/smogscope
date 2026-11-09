@@ -1,9 +1,12 @@
-"""Run the pipeline on a schedule so the database keeps filling up.
+"""Run the warehouse refresh on a schedule so PostgreSQL keeps filling up.
 
 Run it:   python -m aqi_india.scheduler      (Ctrl+C to stop)
 
 Both sources update roughly hourly, so polling every 30 minutes keeps us fresh
-without hammering free APIs.
+without hammering free APIs (CPCB: 8 requests per run).
+
+The old SQLite pipeline (pipeline.py) is no longer scheduled: the API now reads
+the PostgreSQL gold layer.
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from aqi_india.config import TIMEZONE
-from aqi_india.pipeline import run_once
+from aqi_india.warehouse import run_warehouse
 
 INTERVAL_MINUTES = 30
 log = logging.getLogger(__name__)
@@ -21,10 +24,10 @@ log = logging.getLogger(__name__)
 
 def job() -> None:
     try:
-        table = run_once()
-        log.info("Run complete: %d AQI values", len(table))
+        run_warehouse()
+        log.info("Warehouse refresh complete")
     except Exception:
-        log.exception("Pipeline run failed; will retry at the next interval")
+        log.exception("Warehouse refresh failed; will retry at the next interval")
 
 
 def main() -> None:
