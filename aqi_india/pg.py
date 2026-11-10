@@ -63,6 +63,27 @@ def ingest_cpcb() -> dict:
     return run
 
 
+# --- OpenAQ (the same CPCB stations, through a relay that works from abroad) ----
+
+def store_openaq_records(conn: psycopg.Connection, run_id: int, records: list[dict]) -> int:
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO bronze.openaq_record (run_id, record) VALUES (%s, %s)",
+            [(run_id, Jsonb(r)) for r in records],
+        )
+    return len(records)
+
+
+def ingest_openaq() -> dict:
+    from .config import OPENAQ_API_KEY
+    from .fetchers.openaq import fetch_records
+
+    with connect() as conn, ingest_run(conn, "openaq") as run:
+        records = fetch_records(OPENAQ_API_KEY)
+        run["records"] = store_openaq_records(conn, run["run_id"], records)
+    return run
+
+
 # --- Open-Meteo ---------------------------------------------------------------
 # Table names can't be passed as %s parameters (only values can), so they come from
 # this fixed mapping, never from outside input. That rules out SQL injection.
@@ -105,8 +126,12 @@ def ingest_open_meteo(source: str) -> dict:
 
 def ingest_all() -> None:
     """Each source on its own: one failing (e.g. CPCB) must not stop the others."""
+    from .config import STATION_FEED
+
+    # Stations come from ONE route per deployment (config.STATION_FEED, Q48).
+    stations = ("openaq", ingest_openaq) if STATION_FEED == "openaq" else ("cpcb", ingest_cpcb)
     for source, ingest in [
-        ("cpcb", ingest_cpcb),
+        stations,
         ("open-meteo-aq", lambda: ingest_open_meteo("open-meteo-aq")),
         ("open-meteo-weather", lambda: ingest_open_meteo("open-meteo-weather")),
     ]:

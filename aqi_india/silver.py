@@ -4,6 +4,7 @@ Run:  python -m aqi_india.silver
 
 For every bronze run that succeeded and hasn't been transformed yet:
   CPCB records         -> silver.location (stations) + silver.air_quality (measure='sub_index')
+  OpenAQ records       -> silver.location (stations) + silver.air_quality (measure='concentration')
   Open-Meteo AQ JSON   -> silver.location (cities)   + silver.air_quality (measure='concentration')
   Open-Meteo weather   -> silver.weather (one row per city x hour)
 Then the quality checks re-flag the last 72 h of concentrations.
@@ -134,6 +135,58 @@ def transform_cpcb(conn: psycopg.Connection, run_id: int) -> int:
     return upsert_air_quality(conn, df)
 
 
+def _openaq_city(record: dict) -> str:
+    """OpenAQ often leaves `locality` empty; CPCB names look like 'Anand Vihar, Delhi - DPCC'."""
+    if record.get("locality"):
+        return record["locality"]
+    name = record.get("station") or ""
+    return name.split(",")[-1].split(" - ")[0].strip() if "," in name else ""
+
+
+def transform_openaq(conn: psycopg.Connection, run_id: int) -> int:
+    """OpenAQ's CPCB readings -> concentrations in CPCB units, one row per station, pollutant and HOUR.
+
+    Timestamps are rounded down to the hour in INDIA time: CPCB reports on the IST hour,
+    and IST is UTC+5:30, so rounding in UTC would shift every reading by half an hour.
+    Each run sees only the latest reading per sensor, so an hour's value is the latest
+    sample of that hour, not a true hourly mean (a known limitation, Q48).
+    """
+    from .fetchers.openaq import to_cpcb_units
+
+    records = [r for (r,) in conn.execute("SELECT record FROM bronze.openaq_record WHERE run_id = %s", (run_id,))]
+    df = pd.DataFrame(records)
+    if df.empty:
+        return 0
+
+    df["lat"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["longitude"], errors="coerce")
+    df = df[df["lat"].between(-90, 90) & df["lon"].between(-180, 180) & df["station"].notna()].copy()
+
+    # The same name as a data.gov.in station -> the same silver.location row, so history continues.
+    df["city"] = [_openaq_city(r) for r in df.to_dict("records")]
+    stations = df.drop_duplicates("station")
+    ids = upsert_locations(conn, [("station", s.station, s.city, "", s.lat, s.lon) for s in stations.itertuples()])
+
+    df["pollutant"] = df["parameter"]                       # OpenAQ names == our codes (pm25, no2, ...)
+    df["value"] = [to_cpcb_units(p, v, u or "") for p, v, u in zip(df["pollutant"], df["value"], df["units"])]
+    unknown = df["value"].isna()
+    if unknown.any():
+        log.warning("OpenAQ run %s: skipped %d readings with unknown units %s",
+                    run_id, unknown.sum(), df.loc[unknown, "units"].value_counts().to_dict())
+    df = df[~unknown].copy()
+
+    df["observed_at"] = (pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+                         .dt.tz_convert(TIMEZONE).dt.floor("h"))
+    df = df.dropna(subset=["observed_at"])
+    df["location_id"] = [ids[("station", s)] for s in df["station"]]
+    # One row per primary key: the newest reading wins (e.g. a sensor listed twice, or ppm + µg/m³).
+    df = (df.sort_values("datetime_utc")
+            .drop_duplicates(["location_id", "pollutant", "observed_at"], keep="last"))
+
+    df = df.assign(source="openaq", measure="concentration", flag=quality.FLAG_OK, flag_reason=None, run_id=run_id)
+    return upsert_air_quality(conn, df)       # real flags are set by reflag_concentrations()
+
+
 def transform_open_meteo_aq(conn: psycopg.Connection, run_id: int) -> int:
     ids = city_ids(conn)
     now = pd.Timestamp.now(tz=TIMEZONE)
@@ -186,6 +239,7 @@ def transform_open_meteo_weather(conn: psycopg.Connection, run_id: int) -> int:
 
 TRANSFORMS = {
     "cpcb": transform_cpcb,
+    "openaq": transform_openaq,
     "open-meteo-aq": transform_open_meteo_aq,
     "open-meteo-weather": transform_open_meteo_weather,
 }

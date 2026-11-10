@@ -15,6 +15,15 @@ TIMEZONE = "Asia/Kolkata"
 
 # Empty string means "not configured" -> the CPCB fetcher is skipped.
 DATA_GOV_API_KEY = os.getenv("DATA_GOV_API_KEY", "").strip()
+OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY", "").strip()
+
+# Where CPCB station data comes from (Q48). Same stations, two routes:
+#   "data.gov.in": the government API. Only works from an Indian IP address (Q47).
+#   "openaq":      the OpenAQ relay. Works from anywhere, needs OPENAQ_API_KEY.
+# One route per deployment, so a station is never counted twice.
+STATION_FEED = os.getenv("STATION_FEED", "data.gov.in").strip().lower()
+if STATION_FEED not in ("data.gov.in", "openaq"):
+    raise ValueError(f"STATION_FEED must be 'data.gov.in' or 'openaq', not {STATION_FEED!r}")
 
 
 @dataclass(frozen=True)

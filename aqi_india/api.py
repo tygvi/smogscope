@@ -226,7 +226,7 @@ MEASURED_SUBS_SQL = f"""
 SELECT cs.city_id AS location_id, a.observed_at,
        {', '.join(f'avg(a.{c}) AS {c}' for c in SI_COLS)}
 FROM gold.city_station cs
-JOIN gold.aqi_hourly a ON a.location_id = cs.station_id AND a.source = 'cpcb'
+JOIN gold.aqi_hourly a ON a.location_id = cs.station_id AND a.source IN ('cpcb', 'openaq')
 WHERE a.observed_at >= now() - interval '3 hours'
 GROUP BY cs.city_id, a.observed_at
 """
@@ -310,32 +310,43 @@ def overview(conn: Conn) -> Overview:
 
 
 STATIONS_SQL = """
-WITH latest AS (            -- each station's most recent value per pollutant (last 24 h)
+WITH latest AS (            -- data.gov.in: each station's most recent sub-index per pollutant (last 24 h)
     SELECT DISTINCT ON (location_id, pollutant) location_id, pollutant, value, observed_at
     FROM silver.air_quality
     WHERE source = 'cpcb' AND measure = 'sub_index' AND flag = 'ok' AND value IS NOT NULL
       AND observed_at >= now() - interval '24 hours'
     ORDER BY location_id, pollutant, observed_at DESC
+), si AS (
+    SELECT location_id, max(observed_at) AS observed_at,
+           jsonb_object_agg(pollutant, round(value)) AS subs
+    FROM latest GROUP BY location_id
+), g AS (                   -- newest valid AQI from gold, from either station feed
+    SELECT DISTINCT ON (location_id) location_id, observed_at, aqi, category, dominant,
+           jsonb_strip_nulls(jsonb_build_object('pm25', pm25_si, 'pm10', pm10_si, 'no2', no2_si,
+               'so2', so2_si, 'co', co_si, 'o3', o3_si, 'nh3', nh3_si)) AS subs
+    FROM gold.aqi_hourly
+    WHERE source IN ('cpcb', 'openaq') AND observed_at >= now() - interval '24 hours'
+    ORDER BY location_id, observed_at DESC
+), oaq AS (                 -- OpenAQ stations still collecting their first 16 hours (no AQI yet)
+    SELECT DISTINCT location_id FROM silver.air_quality
+    WHERE source = 'openaq' AND observed_at >= now() - interval '3 hours'
 )
 SELECT l.location_id AS id, l.name, l.city, l.state, l.lat, l.lon,
-       max(latest.observed_at) AS observed_at,
-       jsonb_object_agg(latest.pollutant, round(latest.value)) AS subs,
+       coalesce(si.observed_at, g.observed_at) AS observed_at,
+       coalesce(si.subs, g.subs, '{}'::jsonb) AS subs,
        g.aqi, g.category, g.dominant
 FROM silver.location l
-JOIN latest USING (location_id)
-LEFT JOIN LATERAL (         -- its newest valid AQI from gold, if it has one
-    SELECT aqi, category, dominant FROM gold.aqi_hourly
-    WHERE source = 'cpcb' AND location_id = l.location_id AND observed_at >= now() - interval '24 hours'
-    ORDER BY observed_at DESC LIMIT 1
-) g ON true
+LEFT JOIN si  USING (location_id)
+LEFT JOIN g   USING (location_id)
+LEFT JOIN oaq USING (location_id)
 WHERE l.kind = 'station'
-GROUP BY l.location_id, g.aqi, g.category, g.dominant
+  AND (si.location_id IS NOT NULL OR g.location_id IS NOT NULL OR oaq.location_id IS NOT NULL)
 """
 
 
 @app.get("/api/stations", response_model=list[Station])
 def stations(conn: Conn) -> list[Station]:
-    """Every CPCB station that reported in the last 24 h, with its sub-indices and AQI."""
+    """Every CPCB station that reported recently (via data.gov.in or OpenAQ), with its sub-indices and AQI."""
     out = []
     for r in conn.execute(STATIONS_SQL):
         subs = {NAMES.get(code, code): _int(v) for code, v in r["subs"].items()}

@@ -3,7 +3,8 @@
 Run:  python -m aqi_india.gold
 
 1. Model AQI per city and hour (Open-Meteo concentrations -> CPCB formula, in Python: aqi.py)
-2. Station AQI per hour       (CPCB sub-indices -> max sub-index, in SQL)
+2. Station AQI per hour       (data.gov.in sub-indices -> max sub-index, in SQL;
+                               OpenAQ concentrations -> the same Python formula as 1)
 3. Daily summaries + daily pollutant stats (SQL)
 Merging measured vs. modeled happens in the views from sql/003_gold_views.sql.
 
@@ -40,20 +41,22 @@ def upsert_aqi(conn: psycopg.Connection, df: pd.DataFrame) -> int:
     return len(df)
 
 
-def model_aqi(conn: psycopg.Connection, hours: int = 72) -> int:
-    """AQI for the last `hours` from clean model concentrations.
+def concentration_aqi(conn: psycopg.Connection, source: str, hours: int = 72) -> int:
+    """AQI for the last `hours` from clean concentrations of one source:
+    the Open-Meteo model (cities) or OpenAQ (CPCB stations, Q48).
 
     Reads 24 h MORE than it writes: the first hour written needs a full 24 h
-    average behind it (the same reasoning as Q20)."""
+    average behind it (the same reasoning as Q20). A new station therefore gets
+    its first AQI after ~16 hours of readings (CPCB's minimum, aqi.py)."""
     cur = conn.execute(
         "SELECT location_id, observed_at, pollutant, value FROM silver.air_quality"
-        " WHERE source = 'open-meteo' AND measure = 'concentration' AND flag = 'ok'"
-        " AND observed_at >= now() - make_interval(hours => %s)", (hours + 24,))
+        " WHERE source = %s AND measure = 'concentration' AND flag = 'ok'"
+        " AND observed_at >= now() - make_interval(hours => %s)", (source, hours + 24))
     readings = pd.DataFrame(cur.fetchall(), columns=[d.name for d in cur.description])
     if readings.empty:
         return 0
     readings["observed_at"] = pd.to_datetime(readings["observed_at"], utc=True).dt.tz_convert(TIMEZONE)
-    readings = readings.assign(source="open-meteo", location=readings["location_id"],
+    readings = readings.assign(source=source, location=readings["location_id"],
                                state=None, lat=None, lon=None,
                                pollutant=readings["pollutant"].map(QUALITY_NAMES))
 
@@ -63,7 +66,7 @@ def model_aqi(conn: psycopg.Connection, hours: int = 72) -> int:
         return 0
     subs = result["sub_indices"].map(json.loads)
     df = pd.DataFrame({
-        "source": "open-meteo",
+        "source": source,
         "location_id": result["location"],
         "observed_at": result["observed_at"],
         "aqi": result["aqi"],
@@ -73,6 +76,11 @@ def model_aqi(conn: psycopg.Connection, hours: int = 72) -> int:
     for name, code in CODES.items():
         df[f"{code}_si"] = subs.map(lambda s, n=name: s.get(n))
     return upsert_aqi(conn, df)
+
+
+def model_aqi(conn: psycopg.Connection, hours: int = 72) -> int:
+    """Model AQI per city (kept as a name: what concentration_aqi does for Open-Meteo)."""
+    return concentration_aqi(conn, "open-meteo", hours)
 
 
 STATION_AQI_SQL = """
@@ -158,8 +166,8 @@ def daily(conn: psycopg.Connection, days: int = 3) -> tuple[int, int]:
 
 def run_gold() -> None:
     with connect() as conn:                 # one transaction: gold is never half-updated
-        n_model = model_aqi(conn)
-        n_station = station_aqi(conn)
+        n_model = concentration_aqi(conn, "open-meteo")
+        n_station = station_aqi(conn) + concentration_aqi(conn, "openaq")
         n_summary, n_pollutant = daily(conn)
         conn.commit()
     log.info("Gold: %d model AQI hours, %d station AQI hours, %d daily summaries, %d daily pollutant rows",

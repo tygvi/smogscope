@@ -7,6 +7,8 @@
 # Settings come from .env next to this file (never committed):
 #   POSTGRES_PASSWORD   database password (letters and digits only)
 #   DATA_GOV_API_KEY    CPCB key from data.gov.in
+#   OPENAQ_API_KEY      OpenAQ key (the same CPCB stations, reachable from outside India)
+#   STATION_FEED        data.gov.in (default) or openaq
 #   WEB_PORT            where the site is published: 8080 on your Mac, 80 on the server
 
 name: smogscope
@@ -21,6 +23,8 @@ x-app: &app
     # "db" is the database container's name: Compose's private network resolves it.
     SMOGSCOPE_PG_DSN: host=db dbname=smogscope user=smogscope password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     DATA_GOV_API_KEY: ${DATA_GOV_API_KEY:-}
+    OPENAQ_API_KEY: ${OPENAQ_API_KEY:-}
+    STATION_FEED: ${STATION_FEED:-data.gov.in}    # "openaq" on a server outside India (Q48)
     TZ: Asia/Kolkata
   depends_on:
     db:
