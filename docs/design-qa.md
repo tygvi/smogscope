@@ -997,6 +997,200 @@ dashed when estimated**. Station popups are built with `textContent`, never `inn
 data. The city panel compares stations vs. model and charts the model as a line with station readings as dots. Playback uses
 the measured value for any hour where stations reported.
 
+# Deployment: Docker and AWS
+
+## Q43. Why Docker, and how is the image built?
+
+**The problem Docker solves:** the app needs Python 3.13 with exact library versions, Node 22 to build the website,
+and PostgreSQL 17. "Works on my Mac" doesn't mean it works on a Linux server with different versions. A Docker
+**image** is a frozen, read-only package of the OS libraries, runtime, dependencies and code. A **container** is a
+running instance of an image. The same image runs identically on the Mac and on AWS.
+
+**Three files:**
+
+| File | Job |
+|---|---|
+| `Dockerfile` | Recipe for **our** image (used by two containers) |
+| `.dockerignore` | What must **never** go into the image: `.env` (secrets), `.venv`, `node_modules`, `.git`, data, tests |
+| `docker-compose.yml` | Runs the whole system: `db` + `scheduler` + `web`, their settings, network and storage |
+
+**Decisions in the `Dockerfile`:**
+
+- **Multi-stage build.** Stage 1 (`node:22-slim`) compiles React/TypeScript into plain HTML/JS/CSS. Stage 2
+  (`python:3.13-slim`) copies only the finished `dist/` folder. Node, `node_modules` and the compiler never reach the
+  final image, so it's smaller and has less to attack.
+- **Layer caching.** Each instruction is a cached layer. Dependency lists are copied and installed **before** the source
+  code, so editing a `.tsx` or `.py` file reuses the slow `npm ci` / `pip install` layers. The first build took ~126 s;
+  later code-only builds take seconds.
+- **Non-root user** (`smog`, uid 10001). If the app were ever compromised, the attacker would be a powerless user inside a
+  throwaway container.
+- **One image, two jobs.** The default command is the web server (`uvicorn`). Compose overrides it with
+  `python -m aqi_india.scheduler` for the scheduler. Same code, same versions, no drift between the two.
+- `PYTHONUNBUFFERED=1` so `docker compose logs` shows lines immediately. `--host 0.0.0.0` so the server is reachable
+  from outside its container.
+
+**Decisions in `docker-compose.yml`:**
+
+- **The database is the official `postgres:17-alpine` image** with its data in a **named volume** (`pgdata`).
+  Containers are disposable; the volume survives `down`, rebuilds and upgrades.
+- **Migrations on first start:** `sql/` is mounted into `/docker-entrypoint-initdb.d`, which PostgreSQL runs **only when
+  the volume is empty**. Later migrations must be applied by hand. This is a known limitation; a migration tool is a
+  Phase 7 item.
+- **Startup order by health, not by time:** `depends_on: condition: service_healthy` with a `pg_isready` healthcheck. The
+  app starts only once PostgreSQL actually accepts connections, not merely when its container exists.
+- **No database port is published.** Only `scheduler` and `web` can reach it, through Compose's private network, where the
+  hostname `db` resolves to the database container.
+- **`restart: unless-stopped`**: containers come back after a crash or a server reboot.
+- **A YAML anchor** (`x-app: &app`, `<<: *app`) shares the build, environment and dependencies between `scheduler` and `web`,
+  so the two can't drift apart.
+- **Secrets come from `.env`**, which is never committed or copied into the image. `${POSTGRES_PASSWORD:?…}` makes Compose
+  **refuse to start** without a password instead of silently using an empty one.
+- **Port binding** `${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8080}:8000`. The default exposes the site only to the computer
+  itself. The server sets `WEB_BIND=0.0.0.0` and `WEB_PORT=80`.
+
+## Q44. What happened when running Docker locally on a Mac?
+
+- **Colima instead of Docker Desktop.** Docker needs a Linux kernel, so on macOS it runs inside a small Linux VM. Colima
+  is a free, lightweight, command-line VM (`colima start --cpu 2 --memory 4`); Docker Desktop is heavier and has licensing
+  limits for companies. The catch: Colima must be started again after every reboot.
+- **"Port 8080 already allocated."** An old container still held the port. The site moved to `WEB_PORT=8090`.
+- **A security finding.** `lsof` showed Colima's SSH port forwarder listening on **all interfaces** (`*:port`), even though
+  Compose bound `127.0.0.1`. So other devices on the same Wi-Fi could have reached the site. Fixes: `WEB_BIND` defaults to
+  `127.0.0.1`, and the **macOS firewall was turned on**. The full listening-port audit found only expected system services.
+- **A config bug:** a stray character on line 1 of `.env` broke Compose's parser. Lesson: config files fail loudly at
+  startup, which is good. That is why `:?` checks exist.
+
+## Q45. Why one AWS virtual machine, and not Vercel, Render, RDS or containers-as-a-service?
+
+| Option | Why not (for this project) |
+|---|---|
+| **Vercel / Netlify** | Built for websites and short serverless functions. Our scheduler must run **forever**, every 30 minutes, and we need a database. |
+| **Render / Railway** | Easy, but free tiers sleep or expire, and an always-on app plus database costs more than one small VM. Less to learn. |
+| **AWS RDS** (managed PostgreSQL) | ~$15+/month on its own; overkill for a few hundred MB of data. |
+| **ECS / App Runner** | Managed containers, but more moving parts and cost. App Runner was also blocked on this account. |
+| ✅ **One EC2 VM + Docker Compose** | ~$12/month, covered by credits. The exact same Compose file as on the Mac. Teaches real infrastructure: networking, firewalls, SSH, Linux. |
+
+**Cost of the chosen server** (`t4g.micro`, ARM, 2 vCPU, 1 GB RAM, Sydney prices, approximate): server ~$6 + 20 GB disk
+~$2 + **public IPv4 ~$3.6** (AWS has charged for every public IPv4 address since 2024) ≈ **$12/month**. ARM (Graviton) is
+~20% cheaper than equivalent x86. Both images in our stack exist for ARM, so nothing changes.
+
+**Cheaper options considered:** `t4g.nano` (0.5 GB RAM: PostgreSQL plus two Python processes wouldn't fit), Spot instances
+(up to ~70% cheaper, but AWS may reclaim the machine with 2 minutes' notice), Lightsail (~$7 with the IP included: the
+likely home once the credits run out). Because everything is in Docker, moving takes about 15 minutes.
+
+**Known gaps, stated honestly:** no automated database backups yet, no HTTPS yet (it needs a domain), and one machine is
+a single point of failure. All are Phase 7 items.
+
+## Q46. How was the AWS account set up safely?
+
+**Identity:**
+
+- The **root account** is used only for billing. Daily work uses an IAM user, `smogscope-cli`, with access keys stored in
+  `~/.aws/credentials` under a named profile (`AWS_PROFILE=smogscope`), never in the project.
+- **Spending:** a **$20/month hard limit** (the project pauses at the limit), an early control that blocks new resource
+  launches before the limit is reached, and alerts at 50/75/90%. The $120 promotional credits pay for the server.
+
+**A lesson about permissions: SCPs.** Even with `AdministratorAccess`, every EC2 call in Mumbai failed with
+`UnauthorizedOperation ... explicit deny in a service control policy`. A **Service Control Policy** is set at the
+organization level and is a ceiling on what *any* user in the account can do. An **explicit deny always beats an allow**,
+so adding IAM permissions couldn't help. A read-only probe script (list/describe calls only) mapped which services were
+allowed. The EC2 console revealed the cause: this "project" account is **locked to one region, Sydney (`ap-southeast-2`)**,
+where everything except App Runner was allowed.
+
+**The server:**
+
+- **SSH key created locally** (`ssh-keygen -t ed25519`) and only the **public** half uploaded with `import-key-pair`. If
+  AWS generated the key, the private key would travel over the internet once. Generated locally, it never leaves the Mac.
+- **Security group** (the server's firewall, deny-by-default): port **22 (SSH) only from my IP `/32`**, port **80 (HTTP)
+  from everyone**. PostgreSQL's port isn't open at all. The firewall is attached **at launch**, because bots scan new IPs
+  within minutes. The home IP is dynamic (Jio), so the SSH rule needs updating when it changes.
+- **Launch settings:** Ubuntu 24.04 ARM, found through AWS's public SSM parameter so it's always the latest patched image;
+  20 GB **encrypted** gp3 disk; **IMDSv2 required** (`HttpTokens=required`). IMDSv2 blocks a known attack where a tricked
+  web request reads the server's AWS credentials from the metadata endpoint.
+- **`deploy/user-data.sh`**, a script AWS runs once at first boot: 2 GB **swap** (1 GB RAM isn't enough to build the
+  image), Docker from Docker's **official signed repository**, and the `ubuntu` user added to the `docker` group.
+  Afterwards, `cloud-init status --wait` confirmed it finished, then the 10 pending security updates were installed.
+- **Deploying the code:** `git push` from the Mac, `git clone` on the server (the repo is public, so no deploy key is
+  needed), then the same `docker compose up -d --build`.
+- **Secrets on the server:** `.env` created from `.env.example`, `chmod 600`. The database password is **generated on the
+  server** (`openssl rand -hex 16`), so it never existed anywhere else. The API key is pasted with `nano`, not `echo`, so it
+  doesn't enter the shell history. The data.gov.in key was **regenerated** first, because the old one had leaked into logs earlier (Q39).
+
+**Small lessons from the first deploy:**
+
+- `permission denied ... docker.sock`: group membership is read **at login**. The SSH session had started before the setup
+  script added `ubuntu` to the `docker` group. Logging out and back in fixed it.
+- The site loaded in Chrome but **timed out in Brave**. Brave upgrades every site to `https://`, and nothing listens on port
+  443 yet. Diagnosis: `curl` from the Mac worked, so the server and firewall were fine and the problem was the browser. A
+  real HTTPS setup fixes it for every browser.
+
+## Q47. The site worked in the cloud, but government data didn't. Why?
+
+On the server, `/api/health` showed Open-Meteo `ok` but **CPCB `failed`**. The log said:
+`Failed to establish a new connection: [Errno 111] Connection refused`.
+
+**Diagnosis, one variable at a time** (same as Q39):
+
+| Test | Result | Conclusion |
+|---|---|---|
+| Read the error | `Connection refused`, the key shown as `***` | Rejected **before** any key check. A bad key gets an HTTP reply, not a refused connection |
+| `curl https://api.data.gov.in/` from the Mac (India) | `404`: the server answered | The service is up |
+| Same `curl` from the server (Sydney) | `000`: no connection at all | **data.gov.in refuses connections from outside India** |
+
+**Cause: a geo-block.** Indian government services commonly reject foreign IP addresses. It is invisible in local
+development, because a laptop in India is always allowed.
+
+**Options considered:**
+
+| Option | Verdict |
+|---|---|
+| Move the server to **Mumbai** | This account's projects are **locked to one region**. Unlocking regions ("advanced features") **permanently removes the $20 spend limit**, and a new Mumbai project wouldn't use the free credits |
+| Relay through the laptop | The laptop sleeps (Q38) |
+| A free proxy in India | Unreliable, and it would route the API key through strangers |
+| ✅ **Get the same CPCB stations from OpenAQ** | A global open-data relay with no geo-block (Q48) |
+
+Until the fix was deployed, the Sydney server kept running with model data only, which is exactly the graceful
+degradation designed in Q6: one failed source doesn't stop the others.
+
+**Lesson:** **where** the code runs is part of the environment. Docker makes the software identical everywhere, but not
+the network around it. Check every external dependency from the deployment region before choosing it.
+
+## Q48. How does OpenAQ replace data.gov.in on the server?
+
+**Measured first, built second.** A read-only probe (10 Nov 2026) counted OpenAQ's Indian data before any code was written:
+
+| Finding | Value |
+|---|---|
+| Indian locations | 775, of which **576 from provider CPCB** (the rest: low-cost sensors, other feeds) |
+| CPCB locations reporting within 3 h | **480** (data.gov.in gives ~560): about 85% coverage |
+| Age of the newest CPCB reading | ~70 minutes, similar to data.gov.in |
+
+**Decisions:**
+
+- **One route per deployment** (`STATION_FEED=data.gov.in | openaq` in `.env`). Both routes carry the *same* stations, so
+  running both would count each station twice in a city's average. The laptop (in India) keeps data.gov.in; the server
+  uses OpenAQ.
+- **CPCB only.** Low-cost sensors (AirGradient etc.) are skipped: "measured" must mean reference-grade.
+- **Few requests.** The free plan allows 60 requests per minute and 2,000 per hour. Asking per station would take ~576
+  requests per run. Instead: 1 request lists India's locations and their sensors, then 1 request **per pollutant** returns
+  the latest value of every sensor worldwide, and we keep only our sensor IDs. That's a few dozen requests per run, paced
+  at most one per 1.1 s, with retries that respect `Retry-After` on HTTP 429.
+- **The key goes in a header** (`X-API-Key`), never in the URL, so it can't leak into error messages (Q39).
+- **Units:** OpenAQ sends concentrations, sometimes in ppm/ppb. They are converted to CPCB units (µg/m³, CO in mg/m³)
+  using molar masses at 25 °C (1 ppb = M / 24.45 µg/m³). Unknown units are **dropped and logged, never guessed**.
+- **Hours in India time.** Readings are rounded down to the hour in **IST**: CPCB reports on the IST hour, and since IST
+  is UTC+5:30, rounding in UTC would shift every reading by 30 minutes.
+- **Our own AQI.** OpenAQ readings are concentrations, so station AQI goes through the same tested Python formula as the
+  model (`gold.concentration_aqi`), not the SQL max-of-sub-indices used for data.gov.in (Q40). A new station shows an
+  AQI after **~16 hours** of readings (CPCB's minimum for a 24-hour average); until then it appears as a grey dot.
+- **Same station, same row.** If an OpenAQ station has the same name as a data.gov.in one, it reuses that
+  `silver.location` row, so its history continues.
+- Migration `sql/004_openaq.sql` allows the new source, adds `bronze.openaq_record`, and lets
+  `gold.city_measured_hourly` use either feed.
+
+**Known limits:** each run sees only the latest reading per sensor, so an hour's value is a **sample**, not a true hourly
+mean. Coverage is ~85% of data.gov.in's. And if OpenAQ's own collection from CPCB stalls, our data stalls too.
+
 # Code reference: every function
 
 ## `aqi_india/config.py`
@@ -1075,6 +1269,13 @@ the measured value for any hour where stations reported.
 - **`_local_date(ts)`**: timestamp to India calendar date string.
 - **`LOCATION_COLS`**, **`AQI_COLS`**: the shared column lists for location data and `aqi` table rows.
 
+## `aqi_india/fetchers/openaq.py`: CPCB stations through OpenAQ (Q48)
+
+- **`to_cpcb_units(pollutant, value, units)`**: µg/m³, mg/m³, ppm or ppb → CPCB units (CO in mg/m³); `None` for unknown units.
+- **`_Client`**: a paced (≤ 1 call per 1.1 s), retrying session with the key in the `X-API-Key` header; `pages()` follows pagination.
+- **`_cpcb_sensors(client)`**: `{sensor_id: (location, parameter)}` for pollutant sensors of fixed CPCB stations in India.
+- **`fetch_records(api_key, hours_back)`**: one `/parameters/{id}/latest` sweep per pollutant, keeping our sensors; flat records for bronze. No readings → `OpenAQError`.
+
 ## `aqi_india/pg.py`: bronze (raw ingestion into PostgreSQL)
 
 - **`PG_DSN`**: where the database is (`SMOGSCOPE_PG_DSN` environment variable, default `dbname=smogscope`).
@@ -1118,6 +1319,7 @@ the measured value for any hour where stations reported.
 - **`002_silver_measure.sql`**: `silver.air_quality.measure` (in the primary key) and `bronze.ingest_run.silver_done_at`.
 - **`003_gold_views.sql`**: `gold.aqi_category()`, `gold.distance_km()` (haversine), and the views `gold.city_station`,
   `gold.city_measured_hourly` and `gold.city_best` (Q42).
+- **`004_openaq.sql`**: source `openaq` allowed, `bronze.openaq_record`, and `city_measured_hourly` reading either station feed (Q48).
 
 ## `aqi_india/scheduler.py`
 
@@ -1173,3 +1375,127 @@ the measured value for any hour where stations reported.
   closed-ring-safe RDP simplification, coordinate rounding, sliver removal, and point-in-polygon checks (Q37).
 - **`web/public/india-boundary.geojson`**: India's official boundary, simplified (CC-BY-SA 2.5 / ODbL, attribution in the map).
 - **`tests/test_boundary.py`**: guards the official depiction (13 locations, the northern tip, and file size).
+
+## Deployment files
+
+- **`Dockerfile`**: two stages. `web-build` (Node 22) runs `npm ci` and `npm run build`. `app` (Python 3.13 slim) installs
+  `requirements.txt`, copies `aqi_india/`, `sql/` and the built `web/dist`, runs as the non-root user `smog`, and starts
+  `uvicorn` on port 8000 (Q43).
+- **`.dockerignore`**: keeps secrets (`.env`), local environments, build output, git history, data, docs and tests out of the image.
+- **`docker-compose.yml`**: `db` (PostgreSQL 17, volume `pgdata`, migrations from `sql/` on first start, `pg_isready`
+  healthcheck), `scheduler` and `web` (both from the shared `x-app` block; `web` publishes `WEB_BIND:WEB_PORT` and checks
+  `/api/health`) (Q43).
+- **`.env.example`**: the template for `.env`: `DATA_GOV_API_KEY`, `POSTGRES_PASSWORD`, `WEB_PORT`, `WEB_BIND`.
+- **`deploy/user-data.sh`**: EC2 first-boot script: swap, Docker from the official repository, `docker` group (Q46).
+
+# Interview guide: explaining SmogScope end to end
+
+How to talk about this project, from a 30-second pitch to deep follow-ups. Every claim below is backed by a question
+earlier in this document, which is the place to re-read before an interview.
+
+## The 30-second pitch
+
+> "SmogScope is a live air-quality dashboard for India. Every 30 minutes it pulls real measurements from about 560
+> government monitoring stations, plus model forecasts and wind data. It cleans them in a PostgreSQL warehouse and serves
+> them through a FastAPI backend to an animated React map. I built the whole pipeline, from raw API data to a Dockerized
+> deployment on AWS. Along the way I found that the weather model is off by about 75 AQI points on average, which is the
+> base for my next step: an ML model that corrects that error."
+
+## The 2-minute walkthrough (follow the data)
+
+1. **Sources.** CPCB through data.gov.in: real station readings, ~4,000 records per fetch, paginated. Open-Meteo:
+   model air quality and weather for 15 cities in one batched request.
+2. **Scheduler.** APScheduler every 30 minutes, with exactly one catch-up run after downtime (Q38).
+3. **Bronze.** Raw JSON stored exactly as received, plus an audit row per fetch (status, count, error). Insert-only, so
+   any transform bug can be fixed and replayed (Q41).
+4. **Silver.** Typed, de-duplicated, one row per source, place, pollutant, measure and hour. Quality flags catch stuck
+   sensors and impossible PM ratios (Q9 to Q16).
+5. **Gold.** CPCB's official AQI formula, hourly and daily, plus a view that merges measured and modeled data:
+   measured if fresh, the model otherwise, and the gap between them kept for ML (Q42).
+6. **API.** FastAPI with typed response models; it serves the built React site from the same process (Q24 to Q28).
+7. **Frontend.** React + MapLibre: AQI-colored city markers, ~560 station dots on the GPU, a wind particle animation,
+   72-hour playback, India's official boundary (Q29 to Q37).
+8. **Deployment.** One Docker image, three containers (database, scheduler, web) via Compose, on an AWS ARM server with a
+   locked-down firewall, about $12/month (Q43 to Q46).
+
+**Draw this while you talk:**
+
+```
+data.gov.in (CPCB) ─┐                          ┌─> FastAPI ─> React map
+Open-Meteo ─────────┼─> scheduler ─> bronze ─> silver ─> gold
+                    └─ every 30 min      (PostgreSQL, in Docker on AWS EC2)
+```
+
+## Stories to tell (problem → how I found it → fix → lesson)
+
+Interviewers remember stories, not feature lists. Have three ready.
+
+**1. The fake outage (debugging):** Q39.
+The government API returned 502 for 18 hours, so it looked down. I changed one variable at a time with `curl` and found it
+only failed for Python's default User-Agent: a bot filter. Fixed with an honest custom User-Agent. On the way I found two
+more problems: throttling disguised as "200 OK, 0 records", and the API key leaking into error logs, which I redacted.
+*Lesson: compare the requests, not the servers. Don't trust a 200 without checking the body.*
+
+**2. The numbers that weren't what the docs said (data validation):** Q40.
+The field was called `avg_value` with no unit. Four checks proved these were already AQI sub-indices, not concentrations:
+no values above 500, no decimals, implausible CO levels. Running them through the AQI formula again would have produced
+garbage. *Lesson: this is why a raw bronze layer exists. Inspect raw data before transforming it.*
+
+**3. Works locally, fails in the cloud (deployment):** Q47.
+After deploying to AWS Sydney, the government API refused connections. From my Mac it answered; from the server, nothing.
+It was a geo-block on non-Indian IPs. Moving to Mumbai would have meant giving up the account's hard spend limit, so I
+measured an alternative first: OpenAQ relays the same CPCB stations (480 fresh vs. ~560). I added it as a second feed,
+chosen per deployment, with rate-limit-aware fetching and unit conversion (Q48).
+*Lesson: Docker makes the software identical everywhere, but not the network around it. Measure before you build.*
+
+**Backup story: the scheduler that silently skipped runs:** Q38. A library default (`misfire_grace_time = 1 s`) dropped runs
+after the laptop slept, and macOS's monotonic clock pauses during sleep. Fixed with catch-up plus a heartbeat. *Lesson: read
+the defaults, and monitor data freshness, not just whether the process is running.*
+
+## Numbers to remember
+
+| Fact | Value |
+|---|---|
+| Stations / cities | ~560 CPCB stations; 15 cities with model data |
+| Refresh | Every 30 minutes |
+| Model error vs. stations | ~75 AQI points mean absolute error; same category in only 6 of 15 cities |
+| Worst cases | Mumbai model +208 (ozone bias), Delhi −124 (misses local sources) |
+| Spread inside one city | Delhi's 68 stations: 226 to 449 |
+| Server | AWS `t4g.micro` (ARM, 1 GB RAM + 2 GB swap), ~$12/month |
+| Containers | 3: PostgreSQL 17, scheduler, web |
+
+## Likely questions, with short answers
+
+- **Why AQI = the maximum sub-index, not the average?** One dangerous pollutant is enough to harm you; averaging would
+  hide it (Q1).
+- **Why bronze/silver/gold?** Replay after bugs, an audit trail, and one clean shape for two very different sources (Q41).
+- **How do you avoid duplicates?** A primary key on (source, place, pollutant, measure, hour) plus upserts. Running
+  anything twice gives the same result: idempotency (Q5, Q41).
+- **How do you merge measured and modeled data?** Never in storage, only in one gold view. Measured wins if under 2 hours
+  old, and every value says which it is (Q42).
+- **Why PostgreSQL in a container and not RDS?** Cost (~$15+/month for RDS) at a few hundred MB of data. The trade-off:
+  backups are my responsibility, and I haven't automated them yet.
+- **Why Docker?** Identical environments, one command to run everything, the same Compose file on the laptop and the
+  server, and an easy move between providers (Q43).
+- **How is the server secured?** SSH from one IP only with a key that never left my laptop, deny-by-default firewall, no
+  database port, non-root containers, IMDSv2, encrypted disk, secrets only in a `chmod 600` `.env` (Q46).
+- **What happens if one source fails?** It's logged in the audit table and the others continue; the site falls back to
+  model data and labels it "estimated" (Q6, Q42, Q47).
+- **What would break at 100× scale?** One VM is a single point of failure. Bronze grows without limit (it needs
+  de-duplication and retention). Gold recomputation would need incremental updates or TimescaleDB.
+
+## Honest limits and what's next
+
+Saying what's missing shows judgment. Don't hide it.
+
+- **Not yet done:** HTTPS and a domain, automated backups, monitoring/alerts, CI/CD, and bronze retention. Only 15 cities have model data, out of ~290 that CPCB covers.
+- **Next (Phase 5, ML):** learn the model's systematic error from `model_gap` to correct estimates for cities without
+  stations; forecast AQI 24 hours ahead (a scikit-learn baseline first, then an LSTM only if it beats the baseline); flag anomalies.
+- **Later:** satellite data (fire hotspots, smoke) to estimate PM2.5 where there are no stations.
+
+## What I learned (if asked "what was the hardest part?")
+
+The code was rarely the hard part. The hard parts were **data I couldn't trust** (fake outages, undocumented units,
+throttling disguised as success) and **environments I didn't control** (a sleeping laptop, cloud region locks, geo-blocks,
+browser HTTPS upgrades). Each time, the method was the same: **reproduce it, change one variable at a time, fix the root
+cause, write down the lesson.** This document is that record.
