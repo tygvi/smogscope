@@ -89,6 +89,8 @@ cd web && npm run dev                     # terminal 2: app on http://localhost:
 
 # Tests and docs
 pytest && (cd web && npm test)
+ruff check aqi_india tests                # Python lint (pyproject.toml)
+(cd web && npm audit --omit=dev)          # runtime dependency audit
 ./docs/build.sh                           # design Q&A -> docs/build/design-qa.{docx,pdf}
 ```
 
@@ -128,6 +130,9 @@ terraform plan     # after import: "No changes"
 my_ip = "203.0.113.10"   # curl -s https://checkip.amazonaws.com
 ```
 
+Daily backups (7-day retention): `deploy/backup.sh`; install it with
+`0 3 * * * /home/ubuntu/smogscope/deploy/backup.sh` in the server's crontab.
+
 ## API
 
 | Endpoint | Returns |
@@ -139,7 +144,7 @@ my_ip = "203.0.113.10"   # curl -s https://checkip.amazonaws.com
 | `GET /api/cities/{city}/daily?days=14` | Daily summaries with coverage and data quality |
 | `GET /api/timeline?hours=72` | Every city's hourly AQI on one time axis (map playback), measured hours preferred |
 | `GET /api/wind` | u/v wind grid over India (cached for 1 hour) |
-| `GET /api/health` | Newest AQI hour and each source's last fetch status |
+| `GET /api/health` | Newest AQI hour, per-source status/age, and an overall `ok` / `degraded` / `failed` |
 
 Interactive documentation: `http://localhost:8000/docs`.
 

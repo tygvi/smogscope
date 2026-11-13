@@ -18,6 +18,9 @@ docs/build/
 # Runtime logs
 logs/
 
+# Database backups (deploy/backup.sh writes outside the repo by default)
+backups/
+
 # Terraform: provider downloads, state (holds IDs and sometimes secrets), your values
 infra/.terraform/
 infra/*.tfstate
