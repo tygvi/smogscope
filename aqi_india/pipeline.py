@@ -1,6 +1,7 @@
-"""One run: fetch -> store raw -> quality-check -> hourly AQI -> daily summaries.
+"""LEGACY single-file pipeline (SQLite, pre-PostgreSQL).
 
-Run it:   python -m aqi_india.pipeline
+The live scheduler calls `warehouse.run_warehouse()` (bronze -> silver -> gold).
+This module is kept as a tested reference for the original design; it is not deployed.
 """
 from __future__ import annotations
 

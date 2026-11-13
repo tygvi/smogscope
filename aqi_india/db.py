@@ -1,4 +1,7 @@
-"""SQLite storage. Plain SQL on purpose: learn the SQL first, add an ORM later if you want.
+"""LEGACY SQLite storage (pre-PostgreSQL). The live warehouse uses `pg.py`, not this module.
+
+Kept as a small, tested reference for the original single-file design.
+Plain SQL on purpose: learn the SQL first, add an ORM later if you want.
 
 Air-quality readings are stored in *long* format (one row per pollutant reading)
 so adding a new pollutant never needs a schema change. This layout also moves

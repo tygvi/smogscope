@@ -19,6 +19,11 @@ x-app: &app
   build: .
   image: smogscope-app
   restart: unless-stopped           # come back after a crash or a server reboot
+  logging:                          # keep logs from filling the 20 GB disk
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
   environment:
     # "db" is the database container's name: Compose's private network resolves it.
     SMOGSCOPE_PG_DSN: host=db dbname=smogscope user=smogscope password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
@@ -34,6 +39,11 @@ services:
   db:
     image: postgres:17-alpine       # official image, downloaded from Docker Hub
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       POSTGRES_DB: smogscope
       POSTGRES_USER: smogscope
