@@ -1,0 +1,33 @@
+# Production-only override: adds HTTPS in front of the app with Caddy.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# On the server .env must also set:
+#   SITE_ADDRESS=<elastic-ip>.sslip.io
+#   WEB_BIND=127.0.0.1     (only Caddy talks to the web container)
+#   WEB_PORT=8080          (port 80 belongs to Caddy)
+#
+# Local development keeps using plain `docker compose up -d`; this file is not
+# loaded unless explicitly passed with -f.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"          # HTTP/3
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # certificates survive restarts
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

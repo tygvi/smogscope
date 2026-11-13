@@ -1,0 +1,9 @@
+# Caddy reverse proxy for the production server.
+#
+# SITE_ADDRESS comes from .env (e.g. 54.79.229.29.sslip.io). Caddy listens on
+# 80/443 and obtains + renews a Let's Encrypt certificate automatically, then
+# forwards requests to the "web" container over Compose's private network.
+{$SITE_ADDRESS} {
+	encode zstd gzip
+	reverse_proxy web:8000
+}
