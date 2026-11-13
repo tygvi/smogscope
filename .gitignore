@@ -18,6 +18,12 @@ docs/build/
 # Runtime logs
 logs/
 
+# Terraform: provider downloads, state (holds IDs and sometimes secrets), your values
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/terraform.tfvars
+
 # Frontend
 web/node_modules/
 web/dist/
