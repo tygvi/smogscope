@@ -6,11 +6,22 @@
 #   SITE_ADDRESS=<elastic-ip>.sslip.io
 #   WEB_BIND=127.0.0.1     (only Caddy talks to the web container)
 #   WEB_PORT=8080          (port 80 belongs to Caddy)
+#   OPEN_METEO_IP=...      (optional; overrides the pinned weather/wind IP)
 #
 # Local development keeps using plain `docker compose up -d`; this file is not
 # loaded unless explicitly passed with -f.
 
 services:
+  # Open-Meteo's geo-DNS hands the Sydney server an endpoint whose TLS
+  # handshake intermittently hangs. Pin the hostname to a healthy Open-Meteo
+  # address (override with OPEN_METEO_IP in .env if it ever changes).
+  scheduler:
+    extra_hosts:
+      - "api.open-meteo.com:${OPEN_METEO_IP:-157.90.83.168}"
+  web:
+    extra_hosts:
+      - "api.open-meteo.com:${OPEN_METEO_IP:-157.90.83.168}"
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
