@@ -1120,9 +1120,10 @@ where everything except App Runner was allowed.
 
 - `permission denied ... docker.sock`: group membership is read **at login**. The SSH session had started before the setup
   script added `ubuntu` to the `docker` group. Logging out and back in fixed it.
-- The site loaded in Chrome but **timed out in Brave**. Brave upgrades every site to `https://`, and nothing listens on port
-  443 yet. Diagnosis: `curl` from the Mac worked, so the server and firewall were fine and the problem was the browser. A
-  real HTTPS setup fixes it for every browser.
+- The site loaded in Chrome but **timed out in Brave**. Brave upgrades every site to `https://`, and nothing listened on port
+  443 at the time. Diagnosis: `curl` from the Mac worked, so the server and firewall were fine and the problem was the
+  browser. Fixed later with a **Caddy** container (automatic Let's Encrypt certificate, HTTP → HTTPS redirect) behind an
+  **Elastic IP**, so the address and certificate survive restarts.
 
 ## Q47. The site worked in the cloud, but government data didn't. Why?
 
@@ -1154,6 +1155,11 @@ degradation designed in Q6: one failed source doesn't stop the others.
 
 **Lesson:** **where** the code runs is part of the environment. Docker makes the software identical everywhere, but not
 the network around it. Check every external dependency from the deployment region before choosing it.
+
+**A second network surprise, after deployment:** Open-Meteo's geo-DNS gave the Sydney server an address
+(`51.81.167.44`) whose TLS handshake intermittently hung, while the same host answered from India. Weather and the wind
+layer failed on those runs. The production Compose override now pins `api.open-meteo.com` to a healthy address
+(`OPEN_METEO_IP`, default `157.90.83.168`); if Open-Meteo rotates that address, set `OPEN_METEO_IP` in `.env`.
 
 ## Q48. How does OpenAQ replace data.gov.in on the server?
 

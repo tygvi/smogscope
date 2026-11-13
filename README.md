@@ -7,8 +7,8 @@ computes the **official Indian National AQI** (CPCB method), and serves it throu
 ![SmogScope dashboard: India map with AQI markers, smog glow and wind particles](docs/images/dashboard.png)
 
 > **Status:** Phases 1–4 are complete (pipeline, data quality, API, animated frontend), and the backend now runs on a
-> PostgreSQL medallion warehouse with ~560 CPCB stations. ML forecasting and satellite analysis are next. Every design
-> decision is explained in [`docs/design-qa.md`](docs/design-qa.md).
+> PostgreSQL medallion warehouse with ~560 CPCB stations. **Live at <https://54.79.229.29.sslip.io/>** (AWS EC2, HTTPS).
+> ML forecasting and satellite analysis are next. Every design decision is explained in [`docs/design-qa.md`](docs/design-qa.md).
 
 ## Features
 
@@ -93,6 +93,34 @@ pytest && (cd web && npm test)
 ```
 
 The database location can be changed with `SMOGSCOPE_PG_DSN` (default `dbname=smogscope`).
+
+## Deployment
+
+The live site runs three services (`db`, `scheduler`, `web`) plus **Caddy** for HTTPS on a single AWS EC2 instance in
+Sydney (`ap-southeast-2`). Caddy obtains and renews a Let's Encrypt certificate automatically for the Elastic IP's
+`sslip.io` hostname, and redirects HTTP to HTTPS.
+
+```bash
+# On the server, from the repo directory (secrets live in .env, chmod 600):
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+# Logs / status
+docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+docker compose logs -f caddy scheduler
+```
+
+Server-specific `.env` values: `STATION_FEED=openaq` (data.gov.in is geo-blocked outside India),
+`SITE_ADDRESS=<elastic-ip>.sslip.io`, `WEB_BIND=127.0.0.1`, and `WEB_PORT=8080` (port 80 belongs to Caddy).
+The production override also pins `api.open-meteo.com` to a reachable address (`OPEN_METEO_IP`) because the
+geo-DNS answer for Sydney intermittently hangs during the TLS handshake.
+
+AWS infrastructure (security group, key pair, instance, Elastic IP) is managed with Terraform in `infra/`:
+
+```bash
+cd infra
+terraform init
+terraform plan     # after import: "No changes"
+```
 
 ## API
 
