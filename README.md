@@ -122,6 +122,12 @@ terraform init
 terraform plan     # after import: "No changes"
 ```
 
+`infra/terraform.tfvars` (git-ignored) holds your home IP for SSH:
+
+```hcl
+my_ip = "203.0.113.10"   # curl -s https://checkip.amazonaws.com
+```
+
 ## API
 
 | Endpoint | Returns |
