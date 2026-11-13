@@ -11,8 +11,19 @@ from __future__ import annotations
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from aqi_india.config import TIMEZONE, City
+
+# Open-Meteo occasionally drops a connection or returns a 5xx. A short retry
+# turns a transient blip into a successful run instead of a missing 30-min slot.
+_SESSION = requests.Session()
+_SESSION.headers["User-Agent"] = "SmogScope/0.1 (+https://github.com/tygvi/smogscope)"
+_SESSION.mount("https://", HTTPAdapter(max_retries=Retry(
+    total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=("GET",),
+)))
 
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
@@ -49,7 +60,7 @@ def _get(url: str, cities: list[City], extra_params: dict) -> list[dict]:
         "timezone": TIMEZONE,
         **extra_params,
     }
-    resp = requests.get(url, params=params, timeout=30)
+    resp = _SESSION.get(url, params=params, timeout=(10, 30))
     resp.raise_for_status()
     data = resp.json()
     return data if isinstance(data, list) else [data]  # single location -> plain dict
@@ -103,8 +114,8 @@ def fetch_wind_grid(
     """
     import math
 
-    lats = [lat_min + i * step for i in range(int(round((lat_max - lat_min) / step)) + 1)]
-    lons = [lon_min + j * step for j in range(int(round((lon_max - lon_min) / step)) + 1)]
+    lats = [lat_min + i * step for i in range(round((lat_max - lat_min) / step) + 1)]
+    lons = [lon_min + j * step for j in range(round((lon_max - lon_min) / step) + 1)]
     points = [City("", "", lat, lon) for lat in lats for lon in lons]  # row-major, south->north
 
     results = _get(WEATHER_URL, points, {

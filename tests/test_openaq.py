@@ -5,7 +5,6 @@ import pytest
 from aqi_india.fetchers import openaq
 from aqi_india.silver import _openaq_city
 
-
 # --- units ----------------------------------------------------------------------
 
 @pytest.mark.parametrize("pollutant, value, units, expected", [

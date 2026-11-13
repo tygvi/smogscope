@@ -13,7 +13,7 @@ from aqi_india.aqi import category, compute_aqi, rolling_concentrations
 from aqi_india.config import TIMEZONE
 
 LOCATION_COLS = ["source", "location", "state", "lat", "lon"]
-AQI_COLS = LOCATION_COLS + ["observed_at", "aqi", "category", "dominant_pollutant", "sub_indices"]
+AQI_COLS = [*LOCATION_COLS, "observed_at", "aqi", "category", "dominant_pollutant", "sub_indices"]
 
 
 def hourly_aqi(readings: pd.DataFrame, since: pd.Timestamp | None = None) -> pd.DataFrame:

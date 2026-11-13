@@ -4,6 +4,7 @@ Guards web/public/india-boundary.geojson against being replaced by, or
 regenerated from, a dataset that uses de facto (OSM-style) borders.
 """
 import json
+from itertools import pairwise
 
 import pytest
 
@@ -24,7 +25,7 @@ def _inside(point, polygons) -> bool:
     hit = False
     for polygon in polygons:
         for ring in polygon:
-            for (x1, y1), (x2, y2) in zip(ring, ring[1:]):
+            for (x1, y1), (x2, y2) in pairwise(ring):
                 if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
                     hit = not hit
     return hit

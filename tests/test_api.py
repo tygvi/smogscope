@@ -124,6 +124,85 @@ def test_overview(client):
     assert (body["worst"]["location"], body["best"]["location"]) == ("Delhi", "Chennai")
 
 
+def test_api_headers_are_not_cached(client):
+    r = client.get("/api/cities")
+    assert r.headers["cache-control"] == "no-store"
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["x-frame-options"] == "DENY"
+    assert "strict-transport-security" in r.headers
+
+
+def test_health_reports_stale_and_failed_sources(client, test_dsn):
+    with psycopg.connect(test_dsn, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO bronze.ingest_run (source, status, started_at) VALUES"
+            " ('cpcb', 'ok', now() - interval '4 hours'),"
+            " ('open-meteo-aq', 'ok', now()),"
+            " ('open-meteo-weather', 'failed', now())")
+    body = client.get("/api/health").json()
+    assert body["status"] == "degraded"
+    assert body["sources"]["cpcb"]["status"] == "stale"
+    assert body["sources"]["open-meteo-aq"]["status"] == "ok"
+    assert body["sources"]["open-meteo-weather"]["status"] == "failed"
+    assert body["sources"]["cpcb"]["age_seconds"] >= 4 * 3600
+
+
+def test_health_ok_when_all_sources_fresh(client, test_dsn):
+    with psycopg.connect(test_dsn, autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO bronze.ingest_run (source, status, started_at) VALUES"
+            " ('cpcb', 'ok', now()), ('open-meteo-aq', 'ok', now()),"
+            " ('open-meteo-weather', 'ok', now())")
+    body = client.get("/api/health").json()
+    assert body["status"] == "ok"
+    assert all(s["status"] == "ok" for s in body["sources"].values())
+
+
+def test_city_measured_hourly_does_not_double_count_same_station(test_dsn):
+    """The same station can appear via both feeds (during a feed switch). It is one
+    physical station: the freshest reading wins, and `stations` counts it once."""
+    with psycopg.connect(test_dsn, autocommit=True) as conn:
+        conn.execute("TRUNCATE gold.aqi_hourly, silver.air_quality, silver.weather,"
+                     " silver.location, bronze.ingest_run CASCADE")
+        city = conn.execute(
+            "INSERT INTO silver.location (kind, name, city, state, lat, lon)"
+            " VALUES ('city', 'Delhi', 'Delhi', 'Delhi', 28.6139, 77.209) RETURNING location_id").fetchone()[0]
+        station = conn.execute(
+            "INSERT INTO silver.location (kind, name, city, state, lat, lon)"
+            " VALUES ('station', 'Station A', 'Delhi', 'Delhi', 28.62, 77.21) RETURNING location_id").fetchone()[0]
+        hour = "date_trunc('hour', now())"
+        conn.execute(
+            f"INSERT INTO gold.aqi_hourly (source, location_id, observed_at, aqi, category, dominant, computed_at)"
+            f" VALUES ('cpcb', %s, {hour}, 300, 'Poor', 'pm25', now() - interval '1 hour')", (station,))
+        conn.execute(
+            f"INSERT INTO gold.aqi_hourly (source, location_id, observed_at, aqi, category, dominant, computed_at)"
+            f" VALUES ('openaq', %s, {hour}, 310, 'Poor', 'pm25', now())", (station,))
+        aqi, stations = conn.execute(
+            "SELECT aqi, stations FROM gold.city_measured_hourly WHERE location_id = %s", (city,)).fetchone()
+        assert (aqi, stations) == (310, 1)
+
+
+def test_stations_prefers_fresher_gold_over_stale_subindices(client, test_dsn):
+    """A stale data.gov.in sub-index must not hide a newer OpenAQ gold reading."""
+    with psycopg.connect(test_dsn, autocommit=True) as conn:
+        station = conn.execute(
+            "INSERT INTO silver.location (kind, name, city, state, lat, lon)"
+            " VALUES ('station', 'Mixed Feed Station', 'Nowhere', 'S', 15.0, 70.0) RETURNING location_id").fetchone()[0]
+        conn.execute(
+            "INSERT INTO silver.air_quality (source, location_id, pollutant, measure, observed_at, value)"
+            " VALUES ('cpcb', %s, 'pm25', 'sub_index', date_trunc('hour', now()) - interval '2 hours', 111)",
+            (station,))
+        conn.execute(
+            "INSERT INTO gold.aqi_hourly (source, location_id, observed_at, aqi, category, dominant,"
+            " pm25_si, pm10_si, no2_si) VALUES ('openaq', %s, date_trunc('hour', now()), 222, 'Poor', 'pm25',"
+            " 222, 90, 30)", (station,))
+
+    body = {s["name"]: s for s in client.get("/api/stations").json()}
+    s = body["Mixed Feed Station"]
+    assert s["aqi"] == 222
+    assert s["sub_indices"] == {"PM2.5": 222, "PM10": 90, "NO2": 30}
+
+
 def test_stations_lists_every_reporting_station(client):
     body = {s["name"]: s for s in client.get("/api/stations").json()}
     assert set(body) == {"Station A, Delhi", "Far Station"}

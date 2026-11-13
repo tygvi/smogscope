@@ -83,7 +83,7 @@ def check_stuck(
     min_level = STUCK_MIN_LEVEL if min_level is None else min_level
 
     # 1. Put each sensor's readings next to each other, in time order.
-    s = df.sort_values(SERIES_KEYS + ["observed_at"])
+    s = df.sort_values([*SERIES_KEYS, "observed_at"])
 
     # 2. A row CONTINUES the previous row's run only if all three hold:
     same_series = (s[SERIES_KEYS] == s[SERIES_KEYS].shift()).all(axis=1)

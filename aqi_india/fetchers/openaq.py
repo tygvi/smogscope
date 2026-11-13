@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -138,7 +138,7 @@ def fetch_records(api_key: str, hours_back: int = 3) -> list[dict]:
     log.info("OpenAQ: %d CPCB sensors at %d stations, %d parameters",
              len(sensors), len({loc["id"] for loc, _ in sensors.values()}), len(parameter_ids))
 
-    since = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = (datetime.now(UTC) - timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
     records = []
     for parameter_id in parameter_ids:
         for row in client.pages(f"/parameters/{parameter_id}/latest", {"datetime_min": since}):

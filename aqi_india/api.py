@@ -18,13 +18,13 @@ import logging
 import threading
 import time
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated
 
 import pandas as pd
 import psycopg
 import requests
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 from pydantic import BaseModel
@@ -42,6 +42,22 @@ app = FastAPI(
     description="Air quality across India: CPCB station measurements merged with modeled estimates, "
                 "official CPCB AQI method, hourly history, daily summaries, wind.",
 )
+
+@app.middleware("http")
+async def add_headers(request: Request, call_next):
+    """Cache JSON never, cache hashed assets forever, and add basic security headers."""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    elif path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
 
 NAMES = QUALITY_NAMES                                  # "pm25" -> "PM2.5": the names the frontend uses
 SI_COLS = [f"{code}_si" for code in NAMES]
@@ -195,7 +211,7 @@ def _iso(ts: datetime | None) -> str | None:
 
 
 def _int(x) -> int | None:
-    return None if x is None else int(round(float(x)))
+    return None if x is None else round(float(x))
 
 
 def _sub_indices(row: dict) -> dict[str, int]:
@@ -270,9 +286,13 @@ def _latest_cities(conn: psycopg.Connection) -> list[CityNow]:
 # Endpoints
 # ---------------------------------------------------------------------------
 
+FRESH_FOR = timedelta(hours=3)   # scheduler runs every 30 min; 3 h is clearly stale
+
+
 @app.get("/api/health")
 def health(conn: Conn) -> dict:
     """Freshness, not just "the process is up" (Q38): the newest AQI hour, and each source's last fetch."""
+    now = conn.execute("SELECT now() AS t").fetchone()["t"]
     latest = conn.execute("SELECT max(observed_at) AS t FROM gold.aqi_hourly").fetchone()["t"]
     runs = conn.execute(
         "SELECT DISTINCT ON (source) source, status, started_at, records FROM bronze.ingest_run"
@@ -281,12 +301,32 @@ def health(conn: Conn) -> dict:
     # on the Sydney server CPCB is geo-blocked, but OpenAQ carries the same stations.
     active = {"open-meteo-aq", "open-meteo-weather",
               "openaq" if STATION_FEED == "openaq" else "cpcb"}
-    runs = [r for r in runs if r["source"] in active]
+    by_source = {r["source"]: r for r in runs if r["source"] in active}
+
+    sources = {}
+    for source in sorted(active):
+        r = by_source.get(source)
+        if r is None:
+            sources[source] = {"status": "missing", "at": None, "age_seconds": None, "records": None}
+            continue
+        age = (now - r["started_at"]).total_seconds() if r["started_at"] else None
+        status = r["status"]
+        if status == "ok" and age is not None and age > FRESH_FOR.total_seconds():
+            status = "stale"
+        sources[source] = {
+            "status": status, "at": _iso(r["started_at"]),
+            "age_seconds": None if age is None else int(age), "records": r["records"],
+        }
+
+    aqi_age = (now - latest).total_seconds() if latest is not None else None
+    aqi_fresh = aqi_age is not None and aqi_age <= FRESH_FOR.total_seconds()
+    all_fresh = all(s["status"] in ("ok", "running") for s in sources.values())
+    any_data = aqi_fresh or any(s["status"] in ("ok", "running", "stale") for s in sources.values())
     return {
-        "status": "ok",
+        "status": "ok" if all_fresh and aqi_fresh else ("degraded" if any_data else "failed"),
         "latest_aqi_at": _iso(latest),
-        "sources": {r["source"]: {"status": r["status"], "at": _iso(r["started_at"]), "records": r["records"]}
-                    for r in runs},
+        "latest_aqi_age_seconds": None if aqi_age is None else int(aqi_age),
+        "sources": sources,
     }
 
 
@@ -337,8 +377,14 @@ WITH latest AS (            -- data.gov.in: each station's most recent sub-index
     WHERE source = 'openaq' AND observed_at >= now() - interval '3 hours'
 )
 SELECT l.location_id AS id, l.name, l.city, l.state, l.lat, l.lon,
-       coalesce(si.observed_at, g.observed_at) AS observed_at,
-       coalesce(si.subs, g.subs, '{}'::jsonb) AS subs,
+       -- Prefer whichever source reported the newest data. A stale data.gov.in
+       -- sub-index must not hide a fresher OpenAQ gold reading (feed switch).
+       CASE WHEN g.observed_at IS NOT NULL
+                 AND (si.observed_at IS NULL OR g.observed_at > si.observed_at)
+            THEN g.observed_at ELSE si.observed_at END AS observed_at,
+       CASE WHEN g.observed_at IS NOT NULL
+                 AND (si.observed_at IS NULL OR g.observed_at > si.observed_at)
+            THEN g.subs ELSE coalesce(si.subs, g.subs, '{}'::jsonb) END AS subs,
        g.aqi, g.category, g.dominant
 FROM silver.location l
 LEFT JOIN si  USING (location_id)

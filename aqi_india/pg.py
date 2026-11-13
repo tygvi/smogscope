@@ -138,7 +138,8 @@ def ingest_all() -> None:
         try:
             result = ingest()
             log.info("%s -> bronze: run %s stored %s records", source, result["run_id"], result["records"])
-        except Exception as e:          # already logged as 'failed' in bronze.ingest_run
+        except Exception as e:          # one source must not stop the others
+            # already logged as 'failed' in bronze.ingest_run
             log.error("%s -> bronze FAILED: %s", source, e)
 
 

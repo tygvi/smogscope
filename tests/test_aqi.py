@@ -4,7 +4,6 @@ import pytest
 
 from aqi_india.aqi import category, compute_aqi, concentrations_from_hourly, sub_index
 
-
 # ---- sub_index: breakpoints and interpolation ----
 
 @pytest.mark.parametrize(
