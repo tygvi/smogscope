@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-from aqi_india.config import PROJECT_ROOT, TIMEZONE
+from aqi_india.config import PROJECT_ROOT, STATION_FEED, TIMEZONE
 from aqi_india.fetchers import open_meteo
 from aqi_india.pg import PG_DSN
 from aqi_india.silver import QUALITY_NAMES
@@ -277,6 +277,11 @@ def health(conn: Conn) -> dict:
     runs = conn.execute(
         "SELECT DISTINCT ON (source) source, status, started_at, records FROM bronze.ingest_run"
         " ORDER BY source, run_id DESC").fetchall()
+    # A deployment uses one station feed (Q48). Hide the other route's last run:
+    # on the Sydney server CPCB is geo-blocked, but OpenAQ carries the same stations.
+    active = {"open-meteo-aq", "open-meteo-weather",
+              "openaq" if STATION_FEED == "openaq" else "cpcb"}
+    runs = [r for r in runs if r["source"] in active]
     return {
         "status": "ok",
         "latest_aqi_at": _iso(latest),
