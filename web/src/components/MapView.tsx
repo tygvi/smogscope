@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import maplibregl, { type GeoJSONSource, type Map as MlMap } from 'maplibre-gl'
+import * as maplibregl from 'maplibre-gl'
+import type { GeoJSONSource, Map as MlMap, MapLayerMouseEvent } from 'maplibre-gl'
+import type { Feature, FeatureCollection, MultiPolygon, Polygon } from 'geojson'
+// MapLibre v6 ships its worker as a separate file. Vite must emit that file and
+// hand us its hashed URL; otherwise the browser cannot start the map worker.
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import type { Basis, CityNow, Station, Timeline, WindGrid } from '../api'
 import { CATEGORIES, POLLUTANT_LABELS, categoryInfo, colorOf } from '../aqi'
@@ -17,10 +22,12 @@ const STYLE_URL = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.j
 const BASEMAP_BORDER_LAYERS = ['boundary_country_outline', 'boundary_country_inner', 'boundary_state', 'boundary_county']
 const BOUNDARY_URL = '/india-boundary.geojson'
 
-type IndiaBoundary = GeoJSON.FeatureCollection<GeoJSON.MultiPolygon>
+maplibregl.setWorkerUrl(maplibreWorkerUrl)
+
+type IndiaBoundary = FeatureCollection<MultiPolygon>
 
 /** A world-sized polygon with India cut out as holes: used to dim everything outside India. */
-function outsideMask(india: IndiaBoundary): GeoJSON.Feature<GeoJSON.Polygon> {
+function outsideMask(india: IndiaBoundary): Feature<Polygon> {
   const world = [[-180, -85], [180, -85], [180, 85], [-180, 85], [-180, -85]]
   const holes = india.features.flatMap((f) => f.geometry.coordinates.map((polygon) => polygon[0]))
   return { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [world, ...holes] } }
@@ -86,7 +93,9 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = '', className 
 /** The popup shown when a station dot is clicked. */
 function stationCard(s: Station): HTMLElement {
   const root = el('div', '', 'station-card')
-  root.append(el('strong', s.name, 'station-name'), el('div', `${s.city}, ${s.state}`, 'muted small'))
+  root.append(el('strong', s.name, 'station-name'))
+  const place = [s.city, s.state].filter(Boolean).join(', ')
+  if (place) root.append(el('div', place, 'muted small'))
 
   const head = el('div', '', 'station-aqi')
   if (s.aqi != null) {
@@ -197,7 +206,7 @@ export default function MapView(props: Props) {
           'circle-stroke-opacity': ['case', ['get', 'stale'], 0.35, 0.9],
         },
       })
-      m.on('click', 'stations', (e) => {
+      m.on('click', 'stations', (e: MapLayerMouseEvent) => {
         const id = e.features?.[0]?.properties?.id as number | undefined
         const s = id == null ? undefined : stationsRef.current.get(id)
         if (!s) return

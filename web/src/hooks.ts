@@ -20,16 +20,24 @@ export function usePolling<T>(
 
   useEffect(() => {
     const controller = new AbortController()
-    const load = () =>
+    let latest = 0
+    const load = () => {
+      const seq = ++latest
       fetcher(controller.signal)
-        .then((d) => { setData(d); setError(null) })
-        .catch((e: unknown) => {
-          if (!controller.signal.aborted) setError(e instanceof Error ? e : new Error(String(e)))
+        .then((d) => {
+          // Ignore an older response that finished after a newer one.
+          if (!controller.signal.aborted && seq === latest) { setData(d); setError(null) }
         })
+        .catch((e: unknown) => {
+          if (!controller.signal.aborted && seq === latest) {
+            setError(e instanceof Error ? e : new Error(String(e)))
+          }
+        })
+    }
     load()
     const id = window.setInterval(load, intervalMs)
     return () => { controller.abort(); window.clearInterval(id) }
-  }, [intervalMs, key])
+  }, [fetcher, intervalMs, key])
 
   return { data, error }
 }

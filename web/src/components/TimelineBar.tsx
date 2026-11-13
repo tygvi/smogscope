@@ -12,7 +12,8 @@ interface Props {
 export default function TimelineBar({ times, index, playing, onChange, onTogglePlay }: Props) {
   if (times.length < 2) return null
   const last = times.length - 1
-  const current = index ?? last
+  // Clamp: the timeline can shrink when polling refreshes it.
+  const current = Math.min(index ?? last, last)
   const live = index == null
 
   return (

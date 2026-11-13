@@ -51,6 +51,7 @@ export default function App() {
 
   const cityList = cities.data ?? []
   const selectedCity = cityList.find((c) => c.location === selected) ?? null
+  const anyError = cities.error || overview.error || timeline.error || stations.error || wind.error
 
   return (
     <div className={`app ${selectedCity ? 'panel-open' : ''}`}>
@@ -110,9 +111,11 @@ export default function App() {
         <span title="A CPCB monitoring station"><i className="key-station" />Station</span>
       </div>
 
-      {cities.error && !cities.data && (
+      {anyError && (
         <div className="banner" role="alert">
-          Can't reach the SmogScope API. Is it running? <code>uvicorn aqi_india.api:app</code>
+          {cities.data
+            ? 'Some live updates failed; showing the last data received.'
+            : <>Can't reach the SmogScope API. Is it running? <code>uvicorn aqi_india.api:app</code></>}
         </div>
       )}
     </div>

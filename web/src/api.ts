@@ -90,10 +90,23 @@ export interface WindGrid {
   observed_at: string | null
 }
 
+const FETCH_TIMEOUT_MS = 15_000
+
 async function getJSON<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(path, { signal })
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${path}`)
-  return res.json() as Promise<T>
+  // Don't let one hung request stall the polling loop forever.
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  if (signal?.aborted) controller.abort()
+  else signal?.addEventListener('abort', abort, { once: true })
+  const timer = window.setTimeout(abort, FETCH_TIMEOUT_MS)
+  try {
+    const res = await fetch(path, { signal: controller.signal })
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${path}`)
+    return res.json() as Promise<T>
+  } finally {
+    window.clearTimeout(timer)
+    signal?.removeEventListener('abort', abort)
+  }
 }
 
 const enc = encodeURIComponent

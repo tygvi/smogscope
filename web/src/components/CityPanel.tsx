@@ -36,15 +36,22 @@ function categoryStops(maxY: number) {
 export default function CityPanel({ city, onClose }: Props) {
   const [history, setHistory] = useState<CityHistory | null>(null)
   const [daily, setDaily] = useState<DailyRow[] | null>(null)
+  const [error, setError] = useState(false)
+  const [reload, setReload] = useState(0)
   const info = categoryInfo(city.aqi)
 
   useEffect(() => {
     const ctrl = new AbortController()
-    setHistory(null); setDaily(null)
-    api.history(city.location, ctrl.signal).then(setHistory).catch(() => {})
-    api.daily(city.location, ctrl.signal).then(setDaily).catch(() => {})
+    setHistory(null); setDaily(null); setError(false)
+    const fail = (e: unknown) => {
+      if (!ctrl.signal.aborted && !(e instanceof DOMException && e.name === 'AbortError')) setError(true)
+    }
+    api.history(city.location, ctrl.signal)
+      .then((d) => { if (!ctrl.signal.aborted) setHistory(d) }).catch(fail)
+    api.daily(city.location, ctrl.signal)
+      .then((d) => { if (!ctrl.signal.aborted) setDaily(d) }).catch(fail)
     return () => ctrl.abort()
-  }, [city.location])
+  }, [city.location, reload])
 
   // One row per hour: the model's AQI (line) and, where stations reported, the measured AQI (dots).
   const chart = useMemo(() => {
@@ -83,6 +90,13 @@ export default function CityPanel({ city, onClose }: Props) {
         <span className={`basis-dot ${city.basis}`} />
         {measured ? `Measured · ${city.stations} CPCB station${city.stations === 1 ? '' : 's'}` : 'Estimated · Open-Meteo model'}
       </p>
+
+      {error && (
+        <p className="muted small" role="alert">
+          Couldn't load this city's history.{' '}
+          <button className="link-btn" onClick={() => setReload((n) => n + 1)}>Retry</button>
+        </p>
+      )}
 
       <section className="aqi-hero">
         <div className="aqi-big"><AnimatedNumber value={city.aqi} /></div>
@@ -149,14 +163,24 @@ export default function CityPanel({ city, onClose }: Props) {
 
       {w && (
         <section className="weather">
-          <div><span className="muted small">Temp</span><strong>{w.temperature_c?.toFixed(0)}°C</strong></div>
-          <div><span className="muted small">Humidity</span><strong>{w.humidity_pct?.toFixed(0)}%</strong></div>
+          <div>
+            <span className="muted small">Temp</span>
+            <strong>{w.temperature_c != null ? `${w.temperature_c.toFixed(0)}°C` : '—'}</strong>
+          </div>
+          <div>
+            <span className="muted small">Humidity</span>
+            <strong>{w.humidity_pct != null ? `${w.humidity_pct.toFixed(0)}%` : '—'}</strong>
+          </div>
           <div>
             <span className="muted small">Wind</span>
             <strong>
-              {/* Meteorological direction = where wind comes FROM; +180° points where it goes. */}
-              <span className="wind-arrow" style={{ transform: `rotate(${(w.wind_dir_deg ?? 0) + 180}deg)` }} aria-hidden>↑</span>
-              {w.wind_speed_kmh?.toFixed(0)} km/h
+              {w.wind_speed_kmh != null ? (
+                <>
+                  {/* Meteorological direction = where wind comes FROM; +180° points where it goes. */}
+                  <span className="wind-arrow" style={{ transform: `rotate(${(w.wind_dir_deg ?? 0) + 180}deg)` }} aria-hidden>↑</span>
+                  {w.wind_speed_kmh.toFixed(0)} km/h
+                </>
+              ) : '—'}
             </strong>
           </div>
         </section>
@@ -165,7 +189,9 @@ export default function CityPanel({ city, onClose }: Props) {
       <section>
         <h3>Last 72 hours</h3>
         <div className="chart">
-          {chart.length === 0 ? <div className="skeleton" /> : (
+          {!history ? <div className="skeleton" /> : chart.length === 0 ? (
+            <p className="muted small">No hourly history yet.</p>
+          ) : (
             <ResponsiveContainer width="100%" height={150}>
               <ComposedChart data={chart} margin={{ top: 6, right: 4, bottom: 0, left: -18 }}>
                 <defs>
@@ -200,7 +226,9 @@ export default function CityPanel({ city, onClose }: Props) {
       <section>
         <h3>Daily mean AQI <small className="muted">(model)</small></h3>
         <div className="chart">
-          {!daily ? <div className="skeleton short" /> : (
+          {!daily ? <div className="skeleton short" /> : daily.length === 0 ? (
+            <p className="muted small">No daily summaries yet.</p>
+          ) : (
             <ResponsiveContainer width="100%" height={110}>
               <BarChart data={daily} margin={{ top: 6, right: 4, bottom: 0, left: -18 }}>
                 <XAxis dataKey="date" tickFormatter={(d: string) => dayFmt.format(new Date(d))}
